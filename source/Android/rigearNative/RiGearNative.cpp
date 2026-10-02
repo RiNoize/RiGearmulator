@@ -479,6 +479,8 @@ std::string bootPreparedRom(
     g_selectedBank = 0;
     g_selectedProgram = 0;
 
+    g_romIndex = std::move(romIndex);
+
     if (g_hardwareBankCount > 0)
     {
         virusLib::ROMFile::TPreset preset{};
@@ -489,9 +491,8 @@ std::string bootPreparedRom(
         }
     }
 
-    const auto os = romIndex->getOsVersion();
+    const auto os = g_romIndex->getOsVersion();
 
-    g_romIndex = std::move(romIndex);
     g_device = std::move(device);
 
     std::ostringstream out;
