@@ -1,0 +1,52 @@
+name: RiFSVR Android Test
+on:
+  push:
+    branches: [android-rifsvr]
+    paths:
+      - 'rifsvr-android/**'
+      - '.github/workflows/rifsvr-android.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rifsvr-android-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/checkout@v4
+        with:
+          repository: musicastudio/FSVR
+          ref: d6aad1e56454a307fd952d8d4dfce05bea7eda84
+          path: _upstream_fsvr
+          submodules: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare Android SDK
+        run: |
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358'
+          git -C _upstream_fsvr lfs pull --include='plugin/generated/*.syx' --exclude=''
+      - name: Validate source and build tests plus APK
+        shell: bash
+        run: |
+          echo '19a47985ae4491a3eeba2d37c45af38ca4b332a42238f2a645bef14eb590403f  rifsvr-android/project.tar.xz' | sha256sum -c -
+          mkdir -p _rifsvr
+          tar -xJf rifsvr-android/project.tar.xz -C _rifsvr
+          python3 _rifsvr/build.py --upstream "$GITHUB_WORKSPACE/_upstream_fsvr" --sdk "$ANDROID_HOME" 2>&1 | tee build-rifsvr.log
+      - name: Upload APK, corresponding source and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RiFSVR-AndroidTest-arm64
+          path: |
+            _rifsvr/out/*
+            build-rifsvr.log
+          retention-days: 30
+          if-no-files-found: warn
