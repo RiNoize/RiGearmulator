@@ -4,6 +4,10 @@ import android.app.Activity;
 import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Typeface;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioTrack;
 import android.net.Uri;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
@@ -35,6 +39,8 @@ public class MainActivity extends Activity {
     private TextView detailsView;
     private Button loadRomButton;
     private Button selfTestButton;
+    private Button audioTestButton;
+    private volatile boolean deviceReady = false;
 
     private static final class Candidate {
         final String name;
@@ -56,7 +62,7 @@ public class MainActivity extends Activity {
         root.setPadding(48, 28, 48, 28);
 
         TextView title = new TextView(this);
-        title.setText("RiGear 0.2.1 Virus Boot Test");
+        title.setText("RiGear 0.3 Virus Audio Test");
         title.setTextSize(27f);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setGravity(Gravity.CENTER);
@@ -75,6 +81,11 @@ public class MainActivity extends Activity {
         loadRomButton.setText("LOAD VIRUS ROM (.ZIP / .MID / .BIN)");
         loadRomButton.setOnClickListener(v -> pickRom());
 
+        audioTestButton = new Button(this);
+        audioTestButton.setText("PLAY INTERNAL C3 TEST NOTE");
+        audioTestButton.setEnabled(false);
+        audioTestButton.setOnClickListener(v -> playInternalTestNote());
+
         selfTestButton = new Button(this);
         selfTestButton.setText("RUN NATIVE SELF TEST");
         selfTestButton.setOnClickListener(v -> runNativeSelfTest());
@@ -89,6 +100,9 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
         root.addView(loadRomButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        root.addView(audioTestButton, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
         root.addView(selfTestButton, new LinearLayout.LayoutParams(
@@ -176,12 +190,16 @@ public class MainActivity extends Activity {
                     statusView.setText("RiGear / OSIRUS");
 
                     if (finalSuccessResult != null) {
+                        deviceReady = true;
+                        audioTestButton.setEnabled(true);
                         String prefix = selectedName.toLowerCase(Locale.ROOT).endsWith(".zip")
                                 ? "Archive: " + selectedName +
                                   "\nUsing: " + finalSuccessName + "\n\n"
                                 : "";
                         detailsView.setText(prefix + finalSuccessResult);
                     } else {
+                        deviceReady = false;
+                        audioTestButton.setEnabled(false);
                         detailsView.setText(
                                 "Tried " + count + " firmware candidate(s).\n\n" +
                                 finalLastResult);
@@ -195,6 +213,97 @@ public class MainActivity extends Activity {
                     detailsView.setText(t.getClass().getSimpleName() + ": " + t.getMessage());
                     setBusy(false);
                 });
+            }
+        });
+    }
+
+    private void playInternalTestNote() {
+        if (!deviceReady)
+            return;
+
+        setBusy(true);
+        audioTestButton.setEnabled(false);
+        statusView.setText("RiGear / OSIRUS\nRendering C3 inside Virus...");
+        detailsView.setText("Internal Note On/Off only. External MIDI is not involved.");
+
+        nativeExecutor.execute(() -> {
+            AudioTrack track = null;
+            try {
+                final int sampleRate = NativeBridge.nativeGetDeviceSampleRate();
+                final float[] audio = NativeBridge.nativeRenderTestNote(60, 100, 1500);
+
+                if (sampleRate <= 0 || audio == null || audio.length == 0)
+                    throw new IllegalStateException("Native DSP returned no audio buffer.");
+
+                float peak = 0.0f;
+                for (float v : audio)
+                    peak = Math.max(peak, Math.abs(v));
+
+                int minBuffer = AudioTrack.getMinBufferSize(
+                        sampleRate,
+                        AudioFormat.CHANNEL_OUT_STEREO,
+                        AudioFormat.ENCODING_PCM_FLOAT);
+
+                if (minBuffer <= 0)
+                    throw new IllegalStateException(
+                            "AudioTrack rejected sample rate " + sampleRate + " Hz.");
+
+                track = new AudioTrack.Builder()
+                        .setAudioAttributes(new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                .build())
+                        .setAudioFormat(new AudioFormat.Builder()
+                                .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                                .setSampleRate(sampleRate)
+                                .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                                .build())
+                        .setBufferSizeInBytes(Math.max(minBuffer, 32768))
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+                        .build();
+
+                track.play();
+
+                int offset = 0;
+                while (offset < audio.length) {
+                    int written = track.write(
+                            audio,
+                            offset,
+                            audio.length - offset,
+                            AudioTrack.WRITE_BLOCKING);
+
+                    if (written < 0)
+                        throw new IllegalStateException(
+                                "AudioTrack write failed: " + written);
+
+                    offset += written;
+                }
+
+                track.stop();
+
+                final float finalPeak = peak;
+                runOnUiThread(() -> {
+                    statusView.setText("AUDIO TEST: " +
+                            (finalPeak > 0.00001f ? "SIGNAL GENERATED" : "SILENCE"));
+                    detailsView.setText(
+                            "Virus rendered internal C3 Note On/Off.\n" +
+                            "DSP sample rate: " + sampleRate + " Hz\n" +
+                            String.format(Locale.US, "Peak: %.6f", finalPeak) +
+                            "\n\nNo USB MIDI was used.");
+                    setBusy(false);
+                    audioTestButton.setEnabled(deviceReady);
+                });
+            } catch (Throwable t) {
+                final String error = t.getClass().getSimpleName() + ": " + t.getMessage();
+                runOnUiThread(() -> {
+                    statusView.setText("AUDIO TEST: FAILED");
+                    detailsView.setText(error);
+                    setBusy(false);
+                    audioTestButton.setEnabled(deviceReady);
+                });
+            } finally {
+                if (track != null)
+                    track.release();
             }
         });
     }
@@ -307,6 +416,8 @@ public class MainActivity extends Activity {
     private void setBusy(boolean busy) {
         loadRomButton.setEnabled(!busy);
         selfTestButton.setEnabled(!busy);
+        if (audioTestButton != null)
+            audioTestButton.setEnabled(!busy && deviceReady);
     }
 
     @Override

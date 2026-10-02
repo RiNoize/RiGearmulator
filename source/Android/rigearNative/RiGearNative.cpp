@@ -1,6 +1,8 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cctype>
 #include <memory>
 #include <mutex>
@@ -269,6 +271,123 @@ Java_com_rinoize_rigear_NativeBridge_nativeLoadRom(
     {
         return env->NewStringUTF("DSP BOOT: EXCEPTION\nUnknown native error.");
     }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeGetDeviceSampleRate(
+    JNIEnv*,
+    jclass)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_device)
+        return 0;
+    return static_cast<jint>(std::lround(g_device->getSamplerate()));
+}
+
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeRenderTestNote(
+    JNIEnv* env,
+    jclass,
+    jint note,
+    jint velocity,
+    jint durationMs)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!g_device)
+        return env->NewFloatArray(0);
+
+    const int midiNote = std::clamp(static_cast<int>(note), 0, 127);
+    const int midiVelocity = std::clamp(static_cast<int>(velocity), 1, 127);
+    const int heldMs = std::clamp(static_cast<int>(durationMs), 100, 5000);
+
+    const uint32_t sampleRate =
+        static_cast<uint32_t>(std::lround(g_device->getSamplerate()));
+    constexpr uint32_t blockSize = 64;
+
+    const uint32_t heldFramesRaw =
+        static_cast<uint32_t>((static_cast<uint64_t>(sampleRate) * heldMs) / 1000);
+    const uint32_t heldFrames =
+        ((heldFramesRaw + blockSize - 1) / blockSize) * blockSize;
+
+    const uint32_t tailFramesRaw = sampleRate;
+    const uint32_t tailFrames =
+        ((tailFramesRaw + blockSize - 1) / blockSize) * blockSize;
+
+    const uint32_t totalFrames = heldFrames + tailFrames;
+
+    std::vector<float> interleaved(static_cast<size_t>(totalFrames) * 2, 0.0f);
+
+    std::array<std::vector<float>, 4> inputBuffers;
+    std::array<std::vector<float>, 12> outputBuffers;
+
+    for (auto& b : inputBuffers)
+        b.assign(blockSize, 0.0f);
+    for (auto& b : outputBuffers)
+        b.assign(blockSize, 0.0f);
+
+    synthLib::TAudioInputs inputs{};
+    synthLib::TAudioOutputs outputs{};
+
+    for (size_t i = 0; i < inputBuffers.size(); ++i)
+        inputs[i] = inputBuffers[i].data();
+    for (size_t i = 0; i < outputBuffers.size(); ++i)
+        outputs[i] = outputBuffers[i].data();
+
+    std::vector<synthLib::SMidiEvent> midiIn;
+    std::vector<synthLib::SMidiEvent> midiOut;
+
+    for (uint32_t pos = 0; pos < totalFrames; pos += blockSize)
+    {
+        for (auto& b : outputBuffers)
+            std::fill(b.begin(), b.end(), 0.0f);
+
+        midiIn.clear();
+
+        if (pos == 0)
+        {
+            midiIn.emplace_back(
+                synthLib::MidiEventSource::Host,
+                synthLib::M_NOTEON,
+                static_cast<uint8_t>(midiNote),
+                static_cast<uint8_t>(midiVelocity),
+                0);
+        }
+
+        if (pos == heldFrames)
+        {
+            midiIn.emplace_back(
+                synthLib::MidiEventSource::Host,
+                synthLib::M_NOTEOFF,
+                static_cast<uint8_t>(midiNote),
+                0,
+                0);
+        }
+
+        g_device->process(inputs, outputs, blockSize, midiIn, midiOut);
+
+        const auto* left = outputBuffers[0].data();
+        const auto* right = outputBuffers[1].data();
+
+        for (uint32_t i = 0; i < blockSize; ++i)
+        {
+            const size_t dst = static_cast<size_t>(pos + i) * 2;
+            interleaved[dst] = std::clamp(left[i], -1.0f, 1.0f);
+            interleaved[dst + 1] = std::clamp(right[i], -1.0f, 1.0f);
+        }
+    }
+
+    auto result = env->NewFloatArray(static_cast<jsize>(interleaved.size()));
+    if (!result)
+        return nullptr;
+
+    env->SetFloatArrayRegion(
+        result,
+        0,
+        static_cast<jsize>(interleaved.size()),
+        interleaved.data());
+
+    return result;
 }
 
 extern "C" JNIEXPORT void JNICALL
