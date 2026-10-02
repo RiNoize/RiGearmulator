@@ -21,7 +21,14 @@ namespace
 std::mutex g_deviceMutex;
 std::mutex g_midiMutex;
 std::unique_ptr<virusLib::Device> g_device;
+std::unique_ptr<virusLib::ROMFile> g_romIndex;
 std::deque<synthLib::SMidiEvent> g_pendingMidi;
+
+uint32_t g_validRomBankCount = 0;
+uint32_t g_hardwareBankCount = 0;
+int g_selectedBank = 0;
+int g_selectedProgram = 0;
+std::array<uint8_t, 128> g_currentPageA{};
 
 std::array<std::vector<float>, 4> g_inputBuffers;
 std::array<std::vector<float>, 12> g_outputBuffers;
@@ -342,6 +349,168 @@ std::string formatHz(uint64_t hz)
     }
     return out.str();
 }
+
+bool decodeMidiImage(
+    std::vector<uint8_t>& data,
+    uint8_t& firstSector,
+    std::string& error)
+{
+    synthLib::SysexBuffer midiData;
+    midiData.insert(midiData.end(), data.begin(), data.end());
+
+    virusLib::MidiFileToRomData loader;
+    if (!loader.load(midiData, true) || !loader.isValid())
+    {
+        error = "MIDI conversion failed.";
+        return false;
+    }
+
+    firstSector = loader.getFirstSector();
+    data = loader.getData();
+
+    if (firstSector == 0 && data.size() == 0x38000)
+        data.resize(virusLib::ROMFile::getRomSizeModelABC() >> 1, 0xff);
+
+    const auto halfSize = virusLib::ROMFile::getRomSizeModelABC() >> 1;
+    if (data.size() != halfSize)
+    {
+        std::ostringstream out;
+        out << "MIDI image has unexpected size: " << data.size();
+        error = out.str();
+        return false;
+    }
+
+    return true;
+}
+
+int sourceRomBankForHardwareBank(const int hardwareBank)
+{
+    if (hardwareBank < 0)
+        return -1;
+
+    // Virus B/C expose RAM A/B followed by ROM C..H. At startup the emulation
+    // initializes RAM A/B from the first two ROM banks, so the browser can use
+    // the ROM copy for names and initial parameter values.
+    return hardwareBank < 2 ? hardwareBank : hardwareBank - 2;
+}
+
+bool readBrowserPreset(
+    const int hardwareBank,
+    const int program,
+    virusLib::ROMFile::TPreset& preset)
+{
+    if (!g_romIndex || program < 0 || program >= 128)
+        return false;
+
+    const int sourceBank = sourceRomBankForHardwareBank(hardwareBank);
+    if (sourceBank < 0 ||
+        sourceBank >= static_cast<int>(g_validRomBankCount))
+        return false;
+
+    return g_romIndex->getSingle(sourceBank, program, preset);
+}
+
+void cachePresetPageA(const virusLib::ROMFile::TPreset& preset)
+{
+    for (size_t i = 0; i < g_currentPageA.size(); ++i)
+        g_currentPageA[i] = preset[i];
+}
+
+std::string bootPreparedRom(
+    std::vector<uint8_t> data,
+    const std::string& name,
+    const std::string& sourceDescription)
+{
+    const auto model = detectAbcModel(data);
+    if (model == virusLib::DeviceModel::Invalid)
+    {
+        return "ROM VALID: FAILED\nCould not identify Virus A/B/C firmware.";
+    }
+
+    auto romIndex = std::make_unique<virusLib::ROMFile>(data, name, model);
+    if (!romIndex->isValid())
+    {
+        return "ROM VALID: FAILED\nFirmware was recognized but ROM parsing failed.";
+    }
+
+    synthLib::DeviceCreateParams params;
+    params.hostSamplerate = 48000.0f;
+    params.preferredSamplerate = 0.0f;
+    params.romName = name;
+    params.romData = data;
+    params.customData = static_cast<uint32_t>(model);
+
+    std::lock_guard<std::mutex> deviceLock(g_deviceMutex);
+
+    g_device.reset();
+    g_romIndex.reset();
+    clearPendingMidi();
+
+    {
+        std::lock_guard<std::mutex> midiLock(g_midiMutex);
+        resetExternalMidiStatsLocked();
+        g_currentPageA.fill(0);
+    }
+
+    auto device = std::make_unique<virusLib::Device>(params, false);
+    if (!device->isValid())
+        return "DSP BOOT: FAILED\nDevice object is not valid.";
+
+    uint32_t validRomBanks = 0;
+    for (uint32_t bank = 0; bank < 8; ++bank)
+    {
+        virusLib::ROMFile::TPreset first{};
+        virusLib::ROMFile::TPreset last{};
+
+        if (!romIndex->getSingle(static_cast<int>(bank), 0, first) ||
+            !romIndex->getSingle(static_cast<int>(bank), 127, last))
+            break;
+
+        if (virusLib::ROMFile::getSingleName(first).size() != 10 ||
+            virusLib::ROMFile::getSingleName(last).size() != 10)
+            break;
+
+        ++validRomBanks;
+    }
+
+    g_validRomBankCount = validRomBanks;
+    g_hardwareBankCount =
+        validRomBanks > 0 ? std::min<uint32_t>(validRomBanks + 2, 8) : 0;
+    g_selectedBank = 0;
+    g_selectedProgram = 0;
+
+    if (g_hardwareBankCount > 0)
+    {
+        virusLib::ROMFile::TPreset preset{};
+        if (readBrowserPreset(0, 0, preset))
+        {
+            std::lock_guard<std::mutex> midiLock(g_midiMutex);
+            cachePresetPageA(preset);
+        }
+    }
+
+    const auto os = romIndex->getOsVersion();
+
+    g_romIndex = std::move(romIndex);
+    g_device = std::move(device);
+
+    std::ostringstream out;
+    out << "ROM VALID: OK\n"
+        << "Source: " << sourceDescription << "\n"
+        << "Model: Virus " << virusLib::getModelName(model) << "\n";
+
+    if (!os.empty())
+        out << "OS: " << os << "\n";
+
+    out << "DSP BOOT: OK\n"
+        << "Device sample rate: "
+        << static_cast<uint32_t>(g_device->getSamplerate()) << " Hz\n"
+        << "DSP clock: " << formatHz(g_device->getDspClockHz()) << "\n"
+        << "Audio outputs: " << g_device->getChannelCountOut() << "\n"
+        << "Patch banks: " << g_hardwareBankCount;
+
+    return out.str();
+}
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -491,6 +660,258 @@ Java_com_rinoize_rigear_NativeBridge_nativeLoadRom(
     {
         return env->NewStringUTF("DSP BOOT: EXCEPTION\nUnknown native error.");
     }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeLoadRomBundle(
+    JNIEnv* env,
+    jclass,
+    jobjectArray dataArrays,
+    jobjectArray nameArrays)
+{
+    if (!dataArrays || !nameArrays)
+        return env->NewStringUTF("ROM LOAD: FAILED\nNo files received.");
+
+    const jsize count =
+        std::min(env->GetArrayLength(dataArrays), env->GetArrayLength(nameArrays));
+
+    std::vector<uint8_t> binaryImage;
+    std::string binaryName;
+
+    std::vector<uint8_t> firmwareImage;
+    std::string firmwareName;
+
+    std::vector<uint8_t> presetImage;
+    std::string presetName;
+
+    for (jsize i = 0; i < count; ++i)
+    {
+        auto bytes = static_cast<jbyteArray>(
+            env->GetObjectArrayElement(dataArrays, i));
+        auto nameString = static_cast<jstring>(
+            env->GetObjectArrayElement(nameArrays, i));
+
+        if (!bytes || !nameString)
+        {
+            if (bytes)
+                env->DeleteLocalRef(bytes);
+            if (nameString)
+                env->DeleteLocalRef(nameString);
+            continue;
+        }
+
+        const jsize size = env->GetArrayLength(bytes);
+        std::vector<uint8_t> data(static_cast<size_t>(std::max<jsize>(size, 0)));
+        if (size > 0)
+        {
+            env->GetByteArrayRegion(
+                bytes,
+                0,
+                size,
+                reinterpret_cast<jbyte*>(data.data()));
+        }
+
+        const char* chars = env->GetStringUTFChars(nameString, nullptr);
+        std::string name = chars ? chars : "virus.mid";
+        if (chars)
+            env->ReleaseStringUTFChars(nameString, chars);
+
+        env->DeleteLocalRef(bytes);
+        env->DeleteLocalRef(nameString);
+
+        if (hasExtension(name, ".bin"))
+        {
+            if (binaryImage.empty())
+            {
+                binaryImage = std::move(data);
+                binaryName = name;
+            }
+            continue;
+        }
+
+        if (!hasExtension(name, ".mid") && !hasExtension(name, ".midi"))
+            continue;
+
+        uint8_t firstSector = 0xff;
+        std::string error;
+
+        if (!decodeMidiImage(data, firstSector, error))
+            continue;
+
+        if (firstSector == 0 && firmwareImage.empty())
+        {
+            firmwareImage = std::move(data);
+            firmwareName = name;
+        }
+        else if (firstSector == 8 && presetImage.empty())
+        {
+            presetImage = std::move(data);
+            presetName = name;
+        }
+    }
+
+    try
+    {
+        std::string result;
+
+        if (!binaryImage.empty())
+        {
+            result = bootPreparedRom(
+                std::move(binaryImage),
+                binaryName,
+                "binary ROM");
+        }
+        else if (!firmwareImage.empty())
+        {
+            std::string source = "MIDI OS update";
+            std::string name = firmwareName;
+
+            if (!presetImage.empty())
+            {
+                firmwareImage.insert(
+                    firmwareImage.end(),
+                    presetImage.begin(),
+                    presetImage.end());
+
+                source = "MIDI OS + preset image";
+                name += " + " + presetName;
+            }
+
+            result = bootPreparedRom(
+                std::move(firmwareImage),
+                name,
+                source);
+        }
+        else
+        {
+            result = "ROM VALID: FAILED\nNo bootable Virus firmware found.";
+        }
+
+        return env->NewStringUTF(result.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        const std::string s =
+            std::string("DSP BOOT: EXCEPTION\n") + e.what();
+        return env->NewStringUTF(s.c_str());
+    }
+    catch (...)
+    {
+        return env->NewStringUTF(
+            "DSP BOOT: EXCEPTION\nUnknown native error.");
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeGetPatchBankCount(
+    JNIEnv*,
+    jclass)
+{
+    std::lock_guard<std::mutex> lock(g_deviceMutex);
+    return static_cast<jint>(g_hardwareBankCount);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeGetPatchName(
+    JNIEnv* env,
+    jclass,
+    jint bank,
+    jint program)
+{
+    std::lock_guard<std::mutex> lock(g_deviceMutex);
+
+    virusLib::ROMFile::TPreset preset{};
+    if (!readBrowserPreset(bank, program, preset))
+        return env->NewStringUTF("");
+
+    const auto name = virusLib::ROMFile::getSingleName(preset);
+    return env->NewStringUTF(name.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeSelectPatch(
+    JNIEnv* env,
+    jclass,
+    jint bank,
+    jint program)
+{
+    std::lock_guard<std::mutex> deviceLock(g_deviceMutex);
+
+    if (bank < 0 ||
+        bank >= static_cast<jint>(g_hardwareBankCount) ||
+        program < 0 ||
+        program >= 128)
+        return env->NewStringUTF("");
+
+    virusLib::ROMFile::TPreset preset{};
+    if (!readBrowserPreset(bank, program, preset))
+        return env->NewStringUTF("");
+
+    {
+        std::lock_guard<std::mutex> midiLock(g_midiMutex);
+
+        g_pendingMidi.emplace_back(
+            synthLib::MidiEventSource::Host,
+            synthLib::M_CONTROLCHANGE,
+            synthLib::MC_BANKSELECTLSB,
+            static_cast<uint8_t>(bank + 1),
+            0);
+
+        g_pendingMidi.emplace_back(
+            synthLib::MidiEventSource::Host,
+            synthLib::M_PROGRAMCHANGE,
+            static_cast<uint8_t>(program),
+            0,
+            0);
+
+        cachePresetPageA(preset);
+    }
+
+    g_selectedBank = bank;
+    g_selectedProgram = program;
+
+    const auto name = virusLib::ROMFile::getSingleName(preset);
+    return env->NewStringUTF(name.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeGetParameter(
+    JNIEnv*,
+    jclass,
+    jint cc)
+{
+    if (cc < 0 || cc >= 128)
+        return 0;
+
+    std::lock_guard<std::mutex> lock(g_midiMutex);
+    return g_currentPageA[static_cast<size_t>(cc)];
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeSetParameter(
+    JNIEnv*,
+    jclass,
+    jint cc,
+    jint value)
+{
+    if (cc < 0 || cc >= 128)
+        return JNI_FALSE;
+
+    const int v = std::clamp(static_cast<int>(value), 0, 127);
+
+    std::lock_guard<std::mutex> lock(g_midiMutex);
+
+    g_currentPageA[static_cast<size_t>(cc)] =
+        static_cast<uint8_t>(v);
+
+    g_pendingMidi.emplace_back(
+        synthLib::MidiEventSource::Host,
+        synthLib::M_CONTROLCHANGE,
+        static_cast<uint8_t>(cc),
+        static_cast<uint8_t>(v),
+        0);
+
+    return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -811,6 +1232,11 @@ Java_com_rinoize_rigear_NativeBridge_nativeRelease(
 {
     std::lock_guard<std::mutex> lock(g_deviceMutex);
     g_device.reset();
+    g_romIndex.reset();
+    g_validRomBankCount = 0;
+    g_hardwareBankCount = 0;
+    g_selectedBank = 0;
+    g_selectedProgram = 0;
     clearPendingMidi();
     {
         std::lock_guard<std::mutex> midiLock(g_midiMutex);
