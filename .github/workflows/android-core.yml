@@ -30,20 +30,24 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK
+      - name: Prepare Android NDK
         shell: bash
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+          command -v sdkmanager
+          yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "ndk;${NDK_VERSION}"
+          test -f "${ANDROID_HOME}/ndk/${NDK_VERSION}/build/cmake/android.toolchain.cmake"
 
       - name: Configure Gearmulator for Android ARM64
         shell: bash
         run: |
           cmake -S . -B "${BUILD_DIR}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_HOME}/ndk/${NDK_VERSION}/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-21 \
             -DANDROID_ARM_NEON=TRUE \
