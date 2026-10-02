@@ -13,14 +13,21 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 public class MainActivity extends Activity {
     private static final int PICK_ROM = 1001;
-    private static final int MAX_ROM_BYTES = 16 * 1024 * 1024;
+    private static final int MAX_FILE_BYTES = 16 * 1024 * 1024;
+    private static final int MAX_ARCHIVE_UNCOMPRESSED = 64 * 1024 * 1024;
 
     private final ExecutorService nativeExecutor = Executors.newSingleThreadExecutor();
 
@@ -28,6 +35,16 @@ public class MainActivity extends Activity {
     private TextView detailsView;
     private Button loadRomButton;
     private Button selfTestButton;
+
+    private static final class Candidate {
+        final String name;
+        final byte[] data;
+
+        Candidate(String name, byte[] data) {
+            this.name = name;
+            this.data = data;
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -39,7 +56,7 @@ public class MainActivity extends Activity {
         root.setPadding(48, 28, 48, 28);
 
         TextView title = new TextView(this);
-        title.setText("RiGear 0.2 Virus Boot Test");
+        title.setText("RiGear 0.2.1 Virus Boot Test");
         title.setTextSize(27f);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setGravity(Gravity.CENTER);
@@ -55,7 +72,7 @@ public class MainActivity extends Activity {
         detailsView.setPadding(0, 0, 0, 22);
 
         loadRomButton = new Button(this);
-        loadRomButton.setText("LOAD VIRUS A/B/C ROM (.BIN)");
+        loadRomButton.setText("LOAD VIRUS ROM (.ZIP / .MID / .BIN)");
         loadRomButton.setOnClickListener(v -> pickRom());
 
         selfTestButton = new Button(this);
@@ -118,19 +135,58 @@ public class MainActivity extends Activity {
         if (uri == null)
             return;
 
-        final String name = getDisplayName(uri);
+        final String selectedName = getDisplayName(uri);
         setBusy(true);
-        statusView.setText("ROM: " + name + "\nValidating and booting DSP...");
-        detailsView.setText("This can take several seconds on first boot.");
+        statusView.setText("ROM: " + selectedName + "\nInspecting firmware...");
+        detailsView.setText("ZIP, MIDI OS update and raw BIN are accepted.");
 
         nativeExecutor.execute(() -> {
             try {
-                byte[] bytes = readUri(uri);
-                final String result = NativeBridge.nativeLoadRom(bytes, name);
+                byte[] selectedData = readUri(uri, MAX_ARCHIVE_UNCOMPRESSED);
+                List<Candidate> candidates = extractCandidates(selectedName, selectedData);
+
+                if (candidates.isEmpty())
+                    throw new IllegalArgumentException(
+                            "No .mid, .midi or .bin firmware candidate was found.");
+
+                String lastResult = "No valid Virus firmware found.";
+                String successResult = null;
+                String successName = null;
+
+                for (Candidate candidate : candidates) {
+                    final String result = NativeBridge.nativeLoadRom(
+                            candidate.data,
+                            candidate.name);
+
+                    lastResult = result;
+
+                    if (result != null && result.contains("DSP BOOT: OK")) {
+                        successResult = result;
+                        successName = candidate.name;
+                        break;
+                    }
+                }
+
+                final String finalSuccessResult = successResult;
+                final String finalSuccessName = successName;
+                final String finalLastResult = lastResult;
+                final int count = candidates.size();
 
                 runOnUiThread(() -> {
                     statusView.setText("RiGear / OSIRUS");
-                    detailsView.setText(result);
+
+                    if (finalSuccessResult != null) {
+                        String prefix = selectedName.toLowerCase(Locale.ROOT).endsWith(".zip")
+                                ? "Archive: " + selectedName +
+                                  "\nUsing: " + finalSuccessName + "\n\n"
+                                : "";
+                        detailsView.setText(prefix + finalSuccessResult);
+                    } else {
+                        detailsView.setText(
+                                "Tried " + count + " firmware candidate(s).\n\n" +
+                                finalLastResult);
+                    }
+
                     setBusy(false);
                 });
             } catch (Throwable t) {
@@ -143,27 +199,91 @@ public class MainActivity extends Activity {
         });
     }
 
-    private byte[] readUri(Uri uri) throws Exception {
-        try (InputStream in = getContentResolver().openInputStream(uri);
-             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            if (in == null)
-                throw new IllegalStateException("Android could not open the selected file.");
+    private List<Candidate> extractCandidates(String selectedName, byte[] selectedData)
+            throws Exception {
+        String lower = selectedName.toLowerCase(Locale.ROOT);
+        List<Candidate> result = new ArrayList<>();
 
+        if (!lower.endsWith(".zip")) {
+            if (isFirmwareName(lower))
+                result.add(new Candidate(selectedName, selectedData));
+            else
+                throw new IllegalArgumentException(
+                        "Choose a .zip, .mid, .midi or .bin file.");
+            return result;
+        }
+
+        int totalUncompressed = 0;
+
+        try (ZipInputStream zin = new ZipInputStream(
+                new ByteArrayInputStream(selectedData))) {
+            ZipEntry entry;
+            while ((entry = zin.getNextEntry()) != null) {
+                if (entry.isDirectory()) {
+                    zin.closeEntry();
+                    continue;
+                }
+
+                String entryName = entry.getName();
+                String entryLower = entryName.toLowerCase(Locale.ROOT);
+
+                if (!isFirmwareName(entryLower)) {
+                    zin.closeEntry();
+                    continue;
+                }
+
+                byte[] bytes = readLimited(zin, MAX_FILE_BYTES);
+                totalUncompressed += bytes.length;
+
+                if (totalUncompressed > MAX_ARCHIVE_UNCOMPRESSED)
+                    throw new IllegalArgumentException(
+                            "ZIP expands beyond the 64 MB safety limit.");
+
+                result.add(new Candidate(entryName, bytes));
+                zin.closeEntry();
+            }
+        }
+
+        return result;
+    }
+
+    private boolean isFirmwareName(String lowerName) {
+        return lowerName.endsWith(".mid") ||
+               lowerName.endsWith(".midi") ||
+               lowerName.endsWith(".bin");
+    }
+
+    private byte[] readUri(Uri uri, int maxBytes) throws Exception {
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null)
+                throw new IllegalStateException(
+                        "Android could not open the selected file.");
+            return readLimited(in, maxBytes);
+        }
+    }
+
+    private byte[] readLimited(InputStream in, int maxBytes) throws Exception {
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[8192];
             int total = 0;
             int n;
+
             while ((n = in.read(buffer)) >= 0) {
                 total += n;
-                if (total > MAX_ROM_BYTES)
-                    throw new IllegalArgumentException("Selected file is larger than 16 MB.");
+                if (total > maxBytes)
+                    throw new IllegalArgumentException(
+                            "Selected file is larger than the safety limit.");
+
                 out.write(buffer, 0, n);
             }
+
             return out.toByteArray();
         }
     }
 
     private String getDisplayName(Uri uri) {
         String result = "virus.bin";
+
         try (Cursor cursor = getContentResolver().query(
                 uri,
                 new String[]{OpenableColumns.DISPLAY_NAME},
@@ -180,6 +300,7 @@ public class MainActivity extends Activity {
             }
         } catch (Throwable ignored) {
         }
+
         return result;
     }
 

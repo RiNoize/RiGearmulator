@@ -1,5 +1,7 @@
 #include <jni.h>
 
+#include <algorithm>
+#include <cctype>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -8,6 +10,7 @@
 
 #include "virusLib/device.h"
 #include "virusLib/deviceModel.h"
+#include "virusLib/midiFileToRomData.h"
 #include "virusLib/romfile.h"
 
 namespace
@@ -22,20 +25,89 @@ std::string getCoreInfo()
            " | ARM64 core linked";
 }
 
+std::string lowercase(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
+    {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+bool hasExtension(const std::string& name, const char* ext)
+{
+    const auto n = lowercase(name);
+    const std::string e = ext;
+    return n.size() >= e.size() && n.compare(n.size() - e.size(), e.size(), e) == 0;
+}
+
 virusLib::DeviceModel detectAbcModel(const std::vector<uint8_t>& data)
 {
-    const auto os = virusLib::ROMFile::readOsVersion(data);
+    const auto versionString = virusLib::ROMFile::readOsVersion(data);
+    if (versionString.empty())
+        return virusLib::DeviceModel::Invalid;
 
-    if (os.rfind("vc", 0) == 0)
-        return virusLib::DeviceModel::C;
-    if (os.rfind("vb", 0) == 0)
+    const auto starts = [&versionString](const char* key)
+    {
+        return versionString.find(key) == 0;
+    };
+
+    if (starts("vb") || starts("vcl") || starts("vrt"))
         return virusLib::DeviceModel::B;
-    if (os.rfind("v", 0) == 0)
+
+    if (starts("vc") || starts("vr_6"))
+        return virusLib::DeviceModel::C;
+
+    if (starts("vr"))
+        return virusLib::DeviceModel::B;
+
+    if (starts("v2"))
         return virusLib::DeviceModel::A;
 
-    // A/B/C ROMs share the same basic ROM container. C is a safe probe default
-    // when an unusual firmware image does not expose the normal version string.
-    return virusLib::DeviceModel::C;
+    return virusLib::DeviceModel::Invalid;
+}
+
+bool convertMidiFirmware(std::vector<uint8_t>& data, std::string& error)
+{
+    synthLib::SysexBuffer midiData;
+    midiData.insert(midiData.end(), data.begin(), data.end());
+
+    virusLib::MidiFileToRomData midiLoader;
+    if (!midiLoader.load(midiData, true) || !midiLoader.isValid())
+    {
+        error = "MIDI ROM conversion failed.";
+        return false;
+    }
+
+    // Sector 0 is firmware. Sector 8 is a preset-bank MIDI file, which is useful
+    // later but cannot boot the DSP by itself.
+    if (midiLoader.getFirstSector() != 0)
+    {
+        std::ostringstream out;
+        out << "MIDI file is not firmware (first sector "
+            << static_cast<unsigned>(midiLoader.getFirstSector())
+            << ").";
+        error = out.str();
+        return false;
+    }
+
+    data = midiLoader.getData();
+
+    // Old Virus A OS updater is $2000 shorter; upstream ROMLoader pads it.
+    if (data.size() == 0x38000)
+        data.resize(virusLib::ROMFile::getRomSizeModelABC() >> 1, 0xff);
+
+    const auto expectedHalf = virusLib::ROMFile::getRomSizeModelABC() >> 1;
+    if (data.size() != expectedHalf)
+    {
+        std::ostringstream out;
+        out << "Converted MIDI has unexpected ROM size: "
+            << data.size() << " bytes.";
+        error = out.str();
+        return false;
+    }
+
+    return true;
 }
 
 std::string formatHz(uint64_t hz)
@@ -87,7 +159,6 @@ Java_com_rinoize_rigear_NativeBridge_nativeLoadRom(
     if (size <= 0)
         return env->NewStringUTF("ROM LOAD: FAILED\nROM file is empty.");
 
-    // Keep accidental huge file selections from exhausting the app process.
     constexpr jsize maxRomBytes = 16 * 1024 * 1024;
     if (size > maxRomBytes)
         return env->NewStringUTF("ROM LOAD: FAILED\nFile is larger than 16 MB.");
@@ -112,16 +183,40 @@ Java_com_rinoize_rigear_NativeBridge_nativeLoadRom(
 
     try
     {
+        const bool midiSource = hasExtension(name, ".mid") || hasExtension(name, ".midi");
+
+        if (midiSource)
+        {
+            std::string conversionError;
+            if (!convertMidiFirmware(data, conversionError))
+            {
+                const std::string s = std::string("ROM VALID: FAILED\n") +
+                                      conversionError + "\nFile: " + name;
+                return env->NewStringUTF(s.c_str());
+            }
+        }
+
         const auto model = detectAbcModel(data);
+        if (model == virusLib::DeviceModel::Invalid)
+        {
+            std::ostringstream out;
+            out << "ROM VALID: FAILED\n"
+                << "Could not identify Virus A/B/C firmware.\n"
+                << "File: " << name << "\n"
+                << "Input size: " << size << " bytes";
+            const auto s = out.str();
+            return env->NewStringUTF(s.c_str());
+        }
+
         virusLib::ROMFile probe(data, name, model);
 
         if (!probe.isValid())
         {
             std::ostringstream out;
             out << "ROM VALID: FAILED\n"
-                << "This RiGear 0.2 test expects a raw Virus A/B/C .bin ROM.\n"
+                << "Firmware container was recognized but ROM parsing failed.\n"
                 << "File: " << name << "\n"
-                << "Size: " << data.size() << " bytes";
+                << "ROM size after conversion: " << data.size() << " bytes";
             const auto s = out.str();
             return env->NewStringUTF(s.c_str());
         }
@@ -136,9 +231,6 @@ Java_com_rinoize_rigear_NativeBridge_nativeLoadRom(
         std::lock_guard<std::mutex> lock(g_mutex);
         g_device.reset();
 
-        // The Device constructor parses the ROM, creates the DSP56300 instance,
-        // boots the firmware and waits until the Virus microcontroller reports
-        // that the DSP has completed booting.
         auto device = std::make_unique<virusLib::Device>(params, false);
 
         if (!device->isValid())
@@ -146,6 +238,7 @@ Java_com_rinoize_rigear_NativeBridge_nativeLoadRom(
 
         std::ostringstream out;
         out << "ROM VALID: OK\n"
+            << "Source: " << (midiSource ? "MIDI OS update" : "binary ROM") << "\n"
             << "Model: Virus " << virusLib::getModelName(model) << "\n";
 
         const auto os = probe.getOsVersion();
