@@ -5,53 +5,30 @@ plugins {
 android {
     namespace 'com.rinoize.rigear'
     compileSdk 35
+    ndkVersion '27.2.12479018'
 
     defaultConfig {
-        applicationId "com.rinoize.rigear"
+        applicationId 'com.rinoize.rigear'
         minSdk 26
         targetSdk 35
-        versionCode 7
-        versionName "0.6.0"
-
-        ndk {
-            abiFilters 'arm64-v8a'
-        }
-
-        externalNativeBuild {
-            cmake {
-                targets 'rigear_jni'
-                arguments '-Dgearmulator_BUILD_JUCEPLUGIN=OFF',
-                          '-Dgearmulator_SYNTH_OSIRUS=ON',
-                          '-Dgearmulator_SYNTH_OSTIRUS=OFF',
-                          '-Dgearmulator_SYNTH_VAVRA=OFF',
-                          '-Dgearmulator_SYNTH_XENIA=OFF',
-                          '-Dgearmulator_SYNTH_NODALRED2X=OFF',
-                          '-Dgearmulator_SYNTH_JE8086=OFF',
-                          '-Dgearmulator_SYNTH_88EMU=OFF',
-                          '-Dgearmulator_COMPONENT_DSPBRIDGE=OFF',
-                          '-DBUILD_TESTING=OFF',
-                          '-DANDROID_ARM_NEON=TRUE',
-                          '-DANDROID_STL=c++_shared'
-            }
-        }
+        versionCode 8
+        versionName '0.7.0'
+        ndk { abiFilters 'arm64-v8a' }
     }
+
+    // Native code is built explicitly in Release by android-apk.yml and copied
+    // into jniLibs. This avoids silently compiling the DSP as CMake Debug.
+    sourceSets { main { jniLibs.srcDirs = ['src/main/jniLibs'] } }
 
     buildTypes {
-        debug {
-            debuggable true
-        }
+        debug { debuggable true }
         release {
+            debuggable false
             minifyEnabled false
+            // Test APK for direct installation only, not a production signing key.
+            signingConfig signingConfigs.debug
         }
     }
-
-    externalNativeBuild {
-        cmake {
-            path file('../../../../CMakeLists.txt')
-            version '3.22.1'
-        }
-    }
-
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17

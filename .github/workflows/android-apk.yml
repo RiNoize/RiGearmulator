@@ -3,25 +3,29 @@ name: RiGear Android APK
 on:
   workflow_dispatch:
   push:
-    branches:
-      - android-rigear
+    branches: [android-rigear]
     paths:
-      - ".github/workflows/android-apk.yml"
-      - "CMakeLists.txt"
-      - "source/**"
-      - ".gitmodules"
+      - '.github/workflows/android-apk.yml'
+      - 'CMakeLists.txt'
+      - 'source/**'
+      - '.gitmodules'
 
 permissions:
   contents: read
 
+concurrency:
+  group: rigear-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  NDK_VERSION: "27.2.12479018"
+  NDK_VERSION: '27.2.12479018'
+  NATIVE_BUILD: build/android-release
 
 jobs:
   build-apk:
-    name: RiGear debug APK (arm64-v8a)
+    name: RiGear 0.7 optimized ARM64 APK
     runs-on: ubuntu-latest
-
+    timeout-minutes: 35
     steps:
       - name: Checkout RiGearmulator
         uses: actions/checkout@v4
@@ -38,25 +42,101 @@ jobs:
       - name: Prepare Android SDK
         shell: bash
         run: |
-          SDKMANAGER="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager | head -n 1)"
-          test -n "${SDKMANAGER}"
+          SDKMANAGER="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          test -x "${SDKMANAGER}"
           yes | "${SDKMANAGER}" --licenses >/dev/null || true
           "${SDKMANAGER}" "platforms;android-35" "build-tools;35.0.0" "cmake;3.22.1" "ndk;${NDK_VERSION}"
+
+      - name: Test render deadline accounting
+        shell: bash
+        run: |
+          mkdir -p build/meter-tests
+          javac -d build/meter-tests \
+            source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear/RenderMeter.java \
+            source/Android/RiGearApp/tests/RenderMeterTest.java
+          java -cp build/meter-tests RenderMeterTest
+
+      - name: Configure native engine in Release
+        shell: bash
+        run: |
+          CMAKE="${ANDROID_HOME}/cmake/3.22.1/bin/cmake"
+          "$CMAKE" -S . -B "${NATIVE_BUILD}" -G Ninja \
+            -DCMAKE_MAKE_PROGRAM="${ANDROID_HOME}/cmake/3.22.1/bin/ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_HOME}/ndk/${NDK_VERSION}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+            -DANDROID_STL=c++_shared \
+            -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
+            -DBUILD_TESTING=OFF -Dgearmulator_BUILD_JUCEPLUGIN=OFF \
+            -Dgearmulator_SYNTH_OSIRUS=ON -Dgearmulator_SYNTH_OSTIRUS=OFF \
+            -Dgearmulator_SYNTH_VAVRA=OFF -Dgearmulator_SYNTH_XENIA=OFF \
+            -Dgearmulator_SYNTH_NODALRED2X=OFF -Dgearmulator_SYNTH_JE8086=OFF \
+            -Dgearmulator_SYNTH_88EMU=OFF -Dgearmulator_COMPONENT_DSPBRIDGE=OFF
+
+      - name: Verify optimized native build configuration
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          build = pathlib.Path(os.environ['NATIVE_BUILD'])
+          cache = (build / 'CMakeCache.txt').read_text()
+          assert 'CMAKE_BUILD_TYPE:STRING=Release' in cache, 'Native build is not Release'
+          commands = json.loads((build / 'compile_commands.json').read_text())
+          selected = []
+          for suffix in ('virusLib/device.cpp', 'dsp56kEmu/dsp.cpp', 'rigearNative/RiGearRuntime.cpp'):
+              entry = next(e for e in commands if e['file'].endswith(suffix))
+              command = entry['command']
+              assert '-DNDEBUG' in command, 'Assertions/debug config still enabled: ' + suffix
+              assert '-O3' in command or '-Ofast' in command or '-O2' in command, 'Unoptimized: ' + suffix
+              assert '-O0' not in command, 'Debug optimization flag found: ' + suffix
+              selected.append({'source': suffix, 'command': command})
+          pathlib.Path('artifacts').mkdir(exist_ok=True)
+          pathlib.Path('artifacts/native-build.json').write_text(json.dumps({
+              'commit': os.environ['GITHUB_SHA'], 'build_type': 'Release',
+              'ndk': os.environ['NDK_VERSION'], 'commands': selected}, indent=2))
+          print('Verified: Virus, DSP emulator and JNI runtime all use optimized Release/NDEBUG')
+          PY
+
+      - name: Build native shared library
+        shell: bash
+        run: |
+          "${ANDROID_HOME}/cmake/3.22.1/bin/cmake" --build "${NATIVE_BUILD}" \
+            --target rigear_jni --parallel 2
+          JNI_DIR=source/Android/RiGearApp/app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$JNI_DIR"
+          cp "${NATIVE_BUILD}/source/Android/rigearNative/librigear.so" "$JNI_DIR/"
+          cp "${ANDROID_HOME}/ndk/${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$JNI_DIR/"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Build RiGear APK
+      - name: Package optimized test APK
         working-directory: source/Android/RiGearApp
         shell: bash
+        run: gradle --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Verify APK and collect report
+        shell: bash
         run: |
-          gradle --no-daemon --stacktrace :app:assembleDebug
+          cp source/Android/RiGearApp/app/build/outputs/apk/release/app-release.apk artifacts/RiGear-0.7-arm64.apk
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile('artifacts/RiGear-0.7-arm64.apk') as apk:
+              assert 'lib/arm64-v8a/librigear.so' in apk.namelist(), 'Native library missing'
+              assert 'classes.dex' in apk.namelist(), 'Java UI missing'
+          print('APK contains Java UI and ARM64 engine')
+          PY
+          cp source/Android/RiGearApp/TESTING-0.7.md artifacts/
+          echo '### RiGear 0.7' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Native Release verified; 256/512/1024 frames; render-meter unit tests passed.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Device audio, firmware behavior and USB MIDI still require testing on the tablet.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload RiGear APK
         uses: actions/upload-artifact@v4
         with:
-          name: RiGear-0.6-performance-arm64
-          path: source/Android/RiGearApp/app/build/outputs/apk/debug/app-debug.apk
+          name: RiGear-0.7-tweaks-monitor-arm64
+          path: artifacts/
           if-no-files-found: error

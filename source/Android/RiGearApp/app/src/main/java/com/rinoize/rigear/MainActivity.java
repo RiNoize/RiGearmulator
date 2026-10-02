@@ -2,23 +2,13 @@ package com.rinoize.rigear;
 
 import android.app.Activity;
 import android.content.Intent;
-import android.database.Cursor;
 import android.graphics.Color;
-import android.graphics.Typeface;
-import android.media.AudioAttributes;
-import android.media.AudioFormat;
-import android.media.AudioTrack;
-import android.media.midi.MidiDevice;
-import android.media.midi.MidiDeviceInfo;
-import android.media.midi.MidiManager;
-import android.media.midi.MidiOutputPort;
-import android.media.midi.MidiReceiver;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
-import android.provider.OpenableColumns;
+import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -30,1113 +20,406 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
-
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
 
+/** Performance controls plus separate host-CPU, render-deadline and output diagnostics. */
 public class MainActivity extends Activity {
     private static final int PICK_ROM = 1001;
-    private static final int MAX_FILE_BYTES = 16 * 1024 * 1024;
-    private static final int MAX_ARCHIVE_UNCOMPRESSED = 64 * 1024 * 1024;
-    private static final int AUDIO_BLOCK_FRAMES = 256;
+    // One serialized lifecycle for the native engine, including Activity recreation.
+    private static final ExecutorService ENGINE = Executors.newSingleThreadExecutor();
+    private static final int[] BUFFERS = {256, 512, 1024};
+    private static final int[] CLOCKS = {50, 75, 100, 125, 150, 200};
+    private static final int[] LATENCIES = {0, 1, 2, 4, 8};
+    private static final int[] GAINS = {0, -6, -12, -18, -24};
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final RealtimeAudio audio = new RealtimeAudio();
+    private MidiInput midi;
+    private final List<Button> keys = new ArrayList<>();
+    private final List<Binding> bindings = new ArrayList<>();
+    private final List<LinearLayout> pages = new ArrayList<>();
+    private final List<MidiInput.Choice> midiChoices = new ArrayList<>();
+    private TextView status, monitor, patch, midiStatus, configuration;
+    private Button load, start, stop, panic, bankPrev, bankNext, prev, next, sync;
+    private Spinner bufferChoice, clockChoice, latencyChoice, gainChoice, midiChoice;
+    private volatile boolean visible, destroyed, ready, nativeReady, midiGate;
+    private boolean busy;
+    private int bankCount, bank, program;
+    private long cpuTime, wallTime, previousFrames, previousNanos;
+    private RealtimeAudio.Session measuredSession;
+    private double cpuPercent, renderPercent;
+    private int underrunBase;
+    private String problem = "";
 
-    private static final ParameterSpec[] PARAMETERS = {
-            new ParameterSpec("OSC1 SHAPE", 17),
-            new ParameterSpec("OSC2 SHAPE", 22),
-            new ParameterSpec("DETUNE", 26),
-            new ParameterSpec("OSC BAL", 33),
-            new ParameterSpec("CUTOFF", 40),
-            new ParameterSpec("RESONANCE", 42),
-
-            new ParameterSpec("F ENV AMT", 44),
-            new ParameterSpec("F ATTACK", 54),
-            new ParameterSpec("F DECAY", 55),
-            new ParameterSpec("F SUSTAIN", 56),
-            new ParameterSpec("F RELEASE", 58),
-            new ParameterSpec("LFO1 RATE", 67),
-
-            new ParameterSpec("A ATTACK", 59),
-            new ParameterSpec("A DECAY", 60),
-            new ParameterSpec("A SUSTAIN", 61),
-            new ParameterSpec("A RELEASE", 63),
-            new ParameterSpec("PATCH VOL", 91),
-            new ParameterSpec("CHORUS MIX", 105)
-    };
-
-    private final ExecutorService nativeExecutor = Executors.newSingleThreadExecutor();
-    private final List<Button> keyboardButtons = new ArrayList<>();
-    private final List<MidiPortChoice> midiChoices = new ArrayList<>();
-    private final List<KnobBinding> knobBindings = new ArrayList<>();
-    private final Handler uiHandler = new Handler(Looper.getMainLooper());
-
-    private TextView statusView;
-    private TextView detailsView;
-    private TextView midiStatsView;
-    private TextView patchView;
-
-    private Button loadRomButton;
-    private Button selfTestButton;
-    private Button startAudioButton;
-    private Button stopAudioButton;
-    private Button panicButton;
-    private Button refreshMidiButton;
-    private Button connectMidiButton;
-    private Button disconnectMidiButton;
-
-    private Button bankPrevButton;
-    private Button bankNextButton;
-    private Button patchPrevButton;
-    private Button patchNextButton;
-
-    private Spinner midiSpinner;
-
-    private volatile boolean deviceReady = false;
-    private volatile boolean audioRunning = false;
-    private volatile boolean destroyed = false;
-
-    private int patchBankCount = 0;
-    private int currentBank = 0;
-    private int currentProgram = 0;
-
-    private Thread audioThread;
-    private AudioTrack realtimeTrack;
-
-    private MidiManager midiManager;
-    private MidiDevice midiDevice;
-    private MidiOutputPort midiOutputPort;
-    private MidiPortChoice connectedChoice;
-
-    private static final class ParameterSpec {
-        final String label;
-        final int cc;
-
-        ParameterSpec(String label, int cc) {
-            this.label = label;
-            this.cc = cc;
+    private static final class Spec {
+        final String name; final int page, index, min, max;
+        Spec(String name, int index) { this(name, 0x70, index, 0, 127); }
+        Spec(String name, int page, int index, int min, int max) {
+            this.name = name; this.page = page; this.index = index; this.min = min; this.max = max;
         }
     }
-
-    private static final class KnobBinding {
-        final ParameterSpec spec;
-        final KnobView knob;
-
-        KnobBinding(ParameterSpec spec, KnobView knob) {
-            this.spec = spec;
-            this.knob = knob;
-        }
-    }
-
-    private static final class Candidate {
-        final String name;
-        final byte[] data;
-
-        Candidate(String name, byte[] data) {
-            this.name = name;
-            this.data = data;
-        }
-    }
-
-    private static final class MidiPortChoice {
-        final MidiDeviceInfo deviceInfo;
-        final int portNumber;
-        final String label;
-
-        MidiPortChoice(MidiDeviceInfo deviceInfo, int portNumber, String label) {
-            this.deviceInfo = deviceInfo;
-            this.portNumber = portNumber;
-            this.label = label;
-        }
-
-        @Override
-        public String toString() {
-            return label;
-        }
-    }
-
-    private final MidiReceiver midiReceiver = new MidiReceiver() {
-        @Override
-        public void onSend(byte[] data, int offset, int count, long timestamp) {
-            if (!audioRunning || !deviceReady || destroyed)
-                return;
-
-            NativeBridge.nativeSendMidiBytes(data, offset, count);
+    private static final Spec[][] SPECS = {
+        {
+            new Spec("OSC1 SHAPE", 17), new Spec("OSC1 PW", 18),
+            new Spec("OSC2 SHAPE", 22), new Spec("OSC2 DETUNE", 26),
+            new Spec("FM AMOUNT", 27), new Spec("OSC BALANCE", 33),
+            new Spec("SUB LEVEL", 34), new Spec("NOISE LEVEL", 37),
+            new Spec("CUTOFF 1", 40), new Spec("RESONANCE 1", 42),
+            new Spec("CUTOFF 2", 41), new Spec("RESONANCE 2", 43),
+            new Spec("FILTER BAL", 48), new Spec("FILTER ENV", 44),
+            new Spec("PAN", 10), new Spec("PATCH VOL", 91),
+            new Spec("OSC3 MODE", 0x71, 41, 0, 67), new Spec("OSC3 LEVEL", 0x71, 42, 0, 127)
+        },
+        {
+            new Spec("F ATTACK", 54), new Spec("F DECAY", 55), new Spec("F SUSTAIN", 56),
+            new Spec("F RELEASE", 58), new Spec("LFO1 RATE", 67), new Spec("LFO2 RATE", 79),
+            new Spec("A ATTACK", 59), new Spec("A DECAY", 60), new Spec("A SUSTAIN", 61),
+            new Spec("A RELEASE", 63), new Spec("LFO1 OSC1", 74), new Spec("LFO2 CUTOFF", 88),
+            new Spec("ARP MODE", 0x71, 1, 0, 6), new Spec("ARP PATTERN", 0x71, 2, 0, 63),
+            new Spec("ARP OCTAVES", 0x71, 3, 0, 3), new Spec("ARP HOLD", 0x71, 4, 0, 1),
+            new Spec("CLOCK TEMPO", 0x71, 16, 0, 127), new Spec("PORTAMENTO", 5)
+        },
+        {
+            new Spec("UNISON MODE", 0x70, 97, 0, 15), new Spec("UNI DETUNE", 98),
+            new Spec("UNI SPREAD", 99), new Spec("KEY MODE", 0x70, 94, 0, 5),
+            new Spec("OSC2 SYNC", 0x70, 28, 0, 1), new Spec("PUNCH", 0x71, 36, 0, 127),
+            new Spec("CHORUS MIX", 105), new Spec("CHORUS RATE", 106),
+            new Spec("CHORUS DEPTH", 107), new Spec("CHORUS DELAY", 108),
+            new Spec("CHORUS FB", 109), new Spec("CTRL SMOOTH", 0x71, 25, 0, 3),
+            new Spec("DLY/REV MODE", 0x70, 112, 0, 26), new Spec("FX SEND", 113),
+            new Spec("DELAY TIME", 114), new Spec("DELAY FB", 115),
+            new Spec("RATE/DECAY", 116), new Spec("DELAY COLOR", 119)
         }
     };
-
-    private final Runnable midiStatsUpdater = new Runnable() {
-        @Override
-        public void run() {
-            if (destroyed)
-                return;
-
-            if (midiStatsView != null) {
-                if (midiOutputPort != null) {
-                    midiStatsView.setText(NativeBridge.nativeGetMidiStats());
-                } else {
-                    midiStatsView.setText("USB MIDI: disconnected");
-                }
+    private static final class Binding {
+        final Spec spec; final ControlKnob knob;
+        Binding(Spec spec, ControlKnob knob) { this.spec = spec; this.knob = knob; }
+    }
+    private interface Work { void run() throws Exception; }
+    private final Runnable tick = new Runnable() {
+        @Override public void run() {
+            if (destroyed) return;
+            if (visible) {
+                try { refreshMonitor(); refreshPanel(); controls(); }
+                catch (RuntimeException | LinkageError error) { status.setText("Diagnostico: " + error.getMessage()); }
+                ui.postDelayed(this, 500);
             }
-
-            uiHandler.postDelayed(this, 250);
         }
     };
 
-    private final MidiManager.DeviceCallback midiDeviceCallback =
-            new MidiManager.DeviceCallback() {
-        @Override
-        public void onDeviceAdded(MidiDeviceInfo device) {
-            refreshMidiPorts();
-        }
-
-        @Override
-        public void onDeviceRemoved(MidiDeviceInfo device) {
-            if (connectedChoice != null &&
-                    connectedChoice.deviceInfo.getId() == device.getId()) {
-                closeMidiConnection(true);
-            }
-            refreshMidiPorts();
-        }
-    };
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-
-        // Critical for realtime audio stability on the tablet: while RiGear is
-        // visible, Android must not dim or switch the display off.
+    @Override protected void onCreate(Bundle saved) {
+        super.onCreate(saved);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        LinearLayout root = column();
+        root.setBackgroundColor(0xff121417); root.setPadding(dp(10), dp(6), dp(10), dp(6));
+        TextView title = text("RiGear 0.7  |  OSIRUS / PERFORMANCE + DSP", 19);
+        title.setTextColor(0xffffb34d); root.addView(title);
+        status = text("Inicializando JNI...", 12); root.addView(status);
+        monitor = text("CPU / Render / OV / Underruns", 13);
+        root.addView(monitor); // Stays visible when the panel below scrolls.
+        configuration = text("", 11); root.addView(configuration);
 
-        midiManager = (MidiManager) getSystemService(MIDI_SERVICE);
+        LinearLayout actions = row();
+        load = button("ROM", v -> chooseRom());
+        start = button("START", v -> startAudio());
+        stop = button("STOP", v -> stopAudio());
+        panic = button("PANIC", v -> { if (nativeReady) RuntimeBridge.panic(); clearKeys(); });
+        Button reset = button("RESET METERS", v -> resetMeters());
+        for (Button b : new Button[]{load, start, stop, panic, reset}) actions.addView(b);
+        root.addView(actions);
 
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setKeepScreenOn(true);
+        LinearLayout settings = row();
+        bufferChoice = spinner(new String[]{"256", "512", "1024"}, 1);
+        clockChoice = spinner(new String[]{"50%", "75%", "100%", "125%", "150%", "200%"}, 2);
+        latencyChoice = spinner(new String[]{"0", "1", "2", "4", "8"}, 1);
+        gainChoice = spinner(new String[]{"0 dB", "-6 dB", "-12 dB", "-18 dB", "-24 dB"}, 1);
+        addSetting(settings, "Buffer / bloque", bufferChoice);
+        addSetting(settings, "Clock DSP", clockChoice);
+        addSetting(settings, "Extra DSP bloques", latencyChoice);
+        addSetting(settings, "Salida", gainChoice);
+        root.addView(settings);
+        root.addView(text("Cambiar ajustes con STOP. Clock >100% puede aumentar carga. Extra DSP agrega latencia.", 10));
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setGravity(Gravity.CENTER_HORIZONTAL);
-        root.setPadding(dp(14), dp(8), dp(14), dp(12));
-        root.setBackgroundColor(Color.rgb(18, 19, 21));
+        LinearLayout browser = row();
+        bankPrev = button("BANK -", v -> moveBank(-1)); bankNext = button("BANK +", v -> moveBank(1));
+        prev = button("PATCH -", v -> movePatch(-1)); next = button("PATCH +", v -> movePatch(1));
+        patch = text("Cargar ROM / ZIP", 14);
+        browser.addView(bankPrev); browser.addView(bankNext);
+        browser.addView(patch, new LinearLayout.LayoutParams(0, -2, 1));
+        browser.addView(prev); browser.addView(next); root.addView(browser);
 
-        TextView title = makeText("RiGear 0.6  |  VIRUS PERFORMANCE", 23, true);
-        title.setTextColor(Color.rgb(226, 159, 55));
-
-        statusView = makeText("ARM64 CORE", 14, true);
-        detailsView = makeText("", 11, false);
-
-        LinearLayout topActions = horizontalRow();
-
-        loadRomButton = compactButton("LOAD ROM");
-        loadRomButton.setOnClickListener(v -> pickRom());
-
-        startAudioButton = compactButton("START AUDIO");
-        startAudioButton.setOnClickListener(v -> startRealtimeAudio());
-
-        stopAudioButton = compactButton("STOP");
-        stopAudioButton.setOnClickListener(v -> stopRealtimeAudio(true));
-
-        panicButton = compactButton("PANIC");
-        panicButton.setOnClickListener(v -> panic());
-
-        topActions.addView(loadRomButton);
-        topActions.addView(startAudioButton);
-        topActions.addView(stopAudioButton);
-        topActions.addView(panicButton);
-
-        LinearLayout browser = horizontalRow();
-        browser.setPadding(0, dp(3), 0, dp(3));
-
-        bankPrevButton = compactButton("BANK -");
-        bankPrevButton.setOnClickListener(v -> moveBank(-1));
-
-        bankNextButton = compactButton("BANK +");
-        bankNextButton.setOnClickListener(v -> moveBank(1));
-
-        patchPrevButton = compactButton("PATCH -");
-        patchPrevButton.setOnClickListener(v -> movePatch(-1));
-
-        patchNextButton = compactButton("PATCH +");
-        patchNextButton.setOnClickListener(v -> movePatch(1));
-
-        patchView = makeText("PATCH BROWSER: load a ROM", 17, true);
-        patchView.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams patchTextParams = new LinearLayout.LayoutParams(
-                0,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                1.0f);
-
-        browser.addView(bankPrevButton);
-        browser.addView(bankNextButton);
-        browser.addView(patchView, patchTextParams);
-        browser.addView(patchPrevButton);
-        browser.addView(patchNextButton);
-
-        LinearLayout panel = new LinearLayout(this);
-        panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(0, dp(3), 0, dp(3));
-
-        for (int row = 0; row < 3; ++row) {
-            LinearLayout knobRow = horizontalRow();
-            knobRow.setGravity(Gravity.CENTER);
-
-            for (int col = 0; col < 6; ++col) {
-                int index = row * 6 + col;
-                ParameterSpec spec = PARAMETERS[index];
-
-                KnobView knob = new KnobView(this);
-                knob.setLabel(spec.label);
-                knob.setEnabled(false);
-                knob.setOnValueChangedListener((view, value, fromUser) -> {
-                    if (fromUser && deviceReady)
-                        NativeBridge.nativeSetParameter(spec.cc, value);
-                });
-
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                        0,
-                        dp(112),
-                        1.0f);
-
-                knobRow.addView(knob, lp);
-                knobBindings.add(new KnobBinding(spec, knob));
-            }
-
-            panel.addView(knobRow, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout tabs = row();
+        String[] tabNames = {"OSC / FILTER", "ENV / LFO / ARP", "FX / UNISON"};
+        for (int i = 0; i < tabNames.length; ++i) {
+            final int tab = i;
+            tabs.addView(button(tabNames[i], v -> showPage(tab)));
         }
-
-        LinearLayout midiControls = horizontalRow();
-
-        midiSpinner = new Spinner(this);
-        ArrayAdapter<MidiPortChoice> adapter = new ArrayAdapter<>(
-                this,
-                android.R.layout.simple_spinner_item,
-                midiChoices);
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        midiSpinner.setAdapter(adapter);
-
-        refreshMidiButton = compactButton("REFRESH MIDI");
-        refreshMidiButton.setOnClickListener(v -> refreshMidiPorts());
-
-        connectMidiButton = compactButton("CONNECT");
-        connectMidiButton.setOnClickListener(v -> connectSelectedMidi());
-
-        disconnectMidiButton = compactButton("DISCONNECT");
-        disconnectMidiButton.setOnClickListener(v -> closeMidiConnection(true));
-
-        LinearLayout.LayoutParams spinnerParams = new LinearLayout.LayoutParams(
-                0,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                1.0f);
-
-        midiControls.addView(midiSpinner, spinnerParams);
-        midiControls.addView(refreshMidiButton);
-        midiControls.addView(connectMidiButton);
-        midiControls.addView(disconnectMidiButton);
-
-        midiStatsView = makeText("USB MIDI: disconnected", 12, false);
-
-        LinearLayout keyboard = horizontalRow();
-        keyboard.setPadding(0, dp(2), 0, dp(2));
-
-        final String[] labels = {
-                "C3", "C#3", "D3", "D#3", "E3", "F3", "F#3",
-                "G3", "G#3", "A3", "A#3", "B3", "C4"
-        };
-
-        for (int i = 0; i < labels.length; ++i) {
-            final int midiNote = 60 + i;
-            Button key = new Button(this);
-            key.setText(labels[i]);
-            key.setTextSize(9f);
-            key.setEnabled(false);
-            key.setPadding(0, 0, 0, 0);
-            key.setMinWidth(0);
-            key.setMinimumWidth(0);
-            key.setOnTouchListener((v, event) -> handleKeyTouch(v, event, midiNote));
-
-            LinearLayout.LayoutParams keyParams = new LinearLayout.LayoutParams(
-                    0,
-                    dp(42),
-                    1.0f);
-
-            keyboard.addView(key, keyParams);
-            keyboardButtons.add(key);
-        }
-
-        selfTestButton = compactButton("DIAGNOSTIC SELF TEST");
-        selfTestButton.setOnClickListener(v -> runNativeSelfTest());
-
-        root.addView(title);
-        root.addView(statusView);
-        root.addView(detailsView);
-        root.addView(topActions);
-        root.addView(browser, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-        root.addView(panel, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-        root.addView(midiControls, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-        root.addView(midiStatsView);
-        root.addView(keyboard, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-        root.addView(selfTestButton);
-
-        scroll.addView(root);
-        setContentView(scroll);
-
-        if (midiManager != null)
-            midiManager.registerDeviceCallback(midiDeviceCallback, uiHandler);
-
-        runNativeSelfTest();
-        refreshMidiPorts();
-        updateControlState(false);
-        uiHandler.post(midiStatsUpdater);
-    }
-
-    private TextView makeText(String text, int sp, boolean bold) {
-        TextView view = new TextView(this);
-        view.setText(text);
-        view.setTextSize(sp);
-        view.setTextColor(Color.LTGRAY);
-        view.setGravity(Gravity.CENTER);
-        if (bold)
-            view.setTypeface(Typeface.DEFAULT_BOLD);
-        return view;
-    }
-
-    private LinearLayout horizontalRow() {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER);
-        return row;
-    }
-
-    private Button compactButton(String text) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setTextSize(10f);
-        button.setMinHeight(0);
-        button.setMinimumHeight(0);
-        button.setPadding(dp(10), dp(5), dp(10), dp(5));
-        return button;
-    }
-
-    private int dp(int value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
-    }
-
-    private boolean handleKeyTouch(View view, MotionEvent event, int midiNote) {
-        if (!audioRunning)
-            return true;
-
-        switch (event.getActionMasked()) {
-            case MotionEvent.ACTION_DOWN:
-                view.setPressed(true);
-                NativeBridge.nativeNoteOn(midiNote, 100);
-                return true;
-
-            case MotionEvent.ACTION_UP:
-            case MotionEvent.ACTION_CANCEL:
-                NativeBridge.nativeNoteOff(midiNote);
-                view.setPressed(false);
-                return true;
-
-            default:
-                return true;
-        }
-    }
-
-    private void runNativeSelfTest() {
-        try {
-            String info = NativeBridge.nativeGetCoreInfo();
-            int result = NativeBridge.nativeSelfTest();
-
-            statusView.setText(result == 1
-                    ? "ARM64 CORE: OK   JNI: OK   SCREEN: KEEP ON"
-                    : "NATIVE SELF TEST: FAILED");
-            detailsView.setText(info);
-        } catch (Throwable t) {
-            statusView.setText("NATIVE LOAD: FAILED");
-            detailsView.setText(t.getClass().getSimpleName() + ": " + t.getMessage());
-        }
-    }
-
-    private void pickRom() {
-        stopRealtimeAudio(false);
-
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*");
-        startActivityForResult(intent, PICK_ROM);
-    }
-
-    @Override
-    @SuppressWarnings("deprecation")
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-
-        if (requestCode != PICK_ROM || resultCode != RESULT_OK || data == null)
-            return;
-
-        Uri uri = data.getData();
-        if (uri == null)
-            return;
-
-        deviceReady = false;
-        patchBankCount = 0;
-        updateControlState(true);
-
-        String selectedName = getDisplayName(uri);
-        statusView.setText("ROM: " + selectedName + "   loading...");
-        detailsView.setText("Inspecting firmware and preset images inside archive.");
-
-        nativeExecutor.execute(() -> {
-            try {
-                byte[] selectedData = readUri(uri, MAX_ARCHIVE_UNCOMPRESSED);
-                List<Candidate> candidates = extractCandidates(selectedName, selectedData);
-
-                if (candidates.isEmpty())
-                    throw new IllegalArgumentException(
-                            "No .mid, .midi or .bin file found.");
-
-                byte[][] bundleData = new byte[candidates.size()][];
-                String[] bundleNames = new String[candidates.size()];
-
-                for (int i = 0; i < candidates.size(); ++i) {
-                    bundleData[i] = candidates.get(i).data;
-                    bundleNames[i] = candidates.get(i).name;
+        sync = button("SYNC", v -> { if (ready) RuntimeBridge.requestPanel(); });
+        tabs.addView(sync); root.addView(tabs);
+        ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.setKeepScreenOn(true);
+        LinearLayout panel = column();
+        for (Spec[] specs : SPECS) {
+            LinearLayout page = column();
+            for (int r = 0; r < specs.length / 6; ++r) {
+                LinearLayout line = row();
+                for (int c = 0; c < 6; ++c) {
+                    Spec spec = specs[r * 6 + c];
+                    ControlKnob knob = new ControlKnob(this, spec.name, spec.min, spec.max,
+                            value -> { if (ready && !busy) RuntimeBridge.setParameter(spec.page, spec.index, value); });
+                    line.addView(knob, new LinearLayout.LayoutParams(0, dp(107), 1));
+                    bindings.add(new Binding(spec, knob));
                 }
+                page.addView(line);
+            }
+            pages.add(page); panel.addView(page);
+        }
+        panel.addView(text("Valores nativos del Virus (0-127 salvo selectores). UNISON MODE: 0 = apagado.\nSYNC obtiene el edit buffer mientras el audio corre. No se cambian los patches al mostrar perillas.", 11));
+        scroll.addView(panel); root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
 
-                String result = NativeBridge.nativeLoadRomBundle(
-                        bundleData,
-                        bundleNames);
+        LinearLayout midiRow = row();
+        midiChoice = new Spinner(this);
+        midiRow.addView(midiChoice, new LinearLayout.LayoutParams(0, -2, 1));
+        midiRow.addView(button("REFRESH MIDI", v -> refreshMidiChoices()));
+        midiRow.addView(button("CONNECT", v -> {
+            Object selected = midiChoice.getSelectedItem();
+            if (midi != null && selected instanceof MidiInput.Choice) midi.connect((MidiInput.Choice) selected);
+        }));
+        midiRow.addView(button("DISCONNECT", v -> { if (midi != null) midi.disconnect(); }));
+        root.addView(midiRow);
+        midiStatus = text("USB MIDI", 11); root.addView(midiStatus);
+        LinearLayout keyboard = row(); keyboard.setMotionEventSplittingEnabled(true);
+        String[] labels = {"C3", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B", "C4"};
+        for (int i = 0; i < labels.length; ++i) {
+            final int note = 60 + i;
+            Button key = button(labels[i], null);
+            key.setOnTouchListener((view, event) -> {
+                if (event.getActionMasked() == MotionEvent.ACTION_DOWN && midiGate && audio.isRunning()) {
+                    view.setPressed(true); NativeBridge.nativeNoteOn(note, 100); return true;
+                }
+                if (event.getActionMasked() == MotionEvent.ACTION_UP || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+                    if (view.isPressed() && nativeReady) NativeBridge.nativeNoteOff(note);
+                    view.setPressed(false); return true;
+                }
+                return true;
+            });
+            keyboard.addView(key, new LinearLayout.LayoutParams(0, dp(38), 1)); keys.add(key);
+        }
+        root.addView(keyboard); setContentView(root); showPage(0);
+        try {
+            nativeReady = NativeBridge.nativeSelfTest() == 1;
+            status.setText("JNI conectado | pantalla encendida mientras RiGear es visible");
+            midi = new MidiInput(this, ui, () -> midiGate && audio.isRunning() && !destroyed,
+                    this::refreshMidiChoices);
+            refreshMidiChoices();
+        } catch (RuntimeException | LinkageError error) { status.setText("Carga nativa: " + error.getMessage()); }
+        controls();
+    }
 
-                runOnUiThread(() -> {
-                    if (result != null && result.contains("DSP BOOT: OK")) {
-                        deviceReady = true;
-                        patchBankCount = NativeBridge.nativeGetPatchBankCount();
-                        currentBank = 0;
-                        currentProgram = 0;
-
-                        statusView.setText("RiGear / OSIRUS   READY");
-                        detailsView.setText(result);
-
-                        refreshPatchDisplay(false);
-                        refreshKnobsFromNative();
-                    } else {
-                        deviceReady = false;
-                        patchBankCount = 0;
-                        statusView.setText("ROM LOAD: FAILED");
-                        detailsView.setText(result);
-                        patchView.setText("PATCH BROWSER unavailable");
-                    }
-
-                    updateControlState(false);
-                });
-            } catch (Throwable t) {
-                runOnUiThread(() -> {
-                    deviceReady = false;
-                    patchBankCount = 0;
-                    statusView.setText("ROM LOAD: FAILED");
-                    detailsView.setText(t.getClass().getSimpleName() + ": " + t.getMessage());
-                    updateControlState(false);
-                });
+    private void work(String label, Work action) {
+        if (busy || destroyed || !nativeReady) return;
+        busy = true; status.setText(label); controls();
+        ENGINE.execute(() -> {
+            try {
+                if (!destroyed) action.run();
+            } catch (Exception | LinkageError error) {
+                ui.post(() -> { if (!destroyed) { problem = error.toString(); status.setText(problem); } });
+            } finally {
+                ui.post(() -> { if (!destroyed) { busy = false; controls(); } });
             }
         });
     }
-
-    private void moveBank(int delta) {
-        if (!deviceReady || patchBankCount <= 0)
-            return;
-
-        currentBank = (currentBank + delta) % patchBankCount;
-        if (currentBank < 0)
-            currentBank += patchBankCount;
-
-        selectCurrentPatch();
-    }
-
-    private void movePatch(int delta) {
-        if (!deviceReady || patchBankCount <= 0)
-            return;
-
-        int p = currentProgram + delta;
-
-        if (p < 0) {
-            currentProgram = 127;
-            currentBank = (currentBank - 1 + patchBankCount) % patchBankCount;
-        } else if (p > 127) {
-            currentProgram = 0;
-            currentBank = (currentBank + 1) % patchBankCount;
-        } else {
-            currentProgram = p;
-        }
-
-        selectCurrentPatch();
-    }
-
-    private void selectCurrentPatch() {
-        String name = NativeBridge.nativeSelectPatch(currentBank, currentProgram);
-        refreshPatchDisplayWithName(name);
-        refreshKnobsFromNative();
-    }
-
-    private void refreshPatchDisplay(boolean queryName) {
-        if (patchBankCount <= 0) {
-            patchView.setText("No preset banks in this firmware image");
-            return;
-        }
-
-        String name = queryName
-                ? NativeBridge.nativeGetPatchName(currentBank, currentProgram)
-                : NativeBridge.nativeGetPatchName(currentBank, currentProgram);
-
-        refreshPatchDisplayWithName(name);
-    }
-
-    private void refreshPatchDisplayWithName(String name) {
-        if (name == null)
-            name = "";
-
-        char bankLetter = (char)('A' + currentBank);
-
-        patchView.setText(String.format(
-                Locale.US,
-                "BANK %c   %03d   %s",
-                bankLetter,
-                currentProgram + 1,
-                name.trim()));
-    }
-
-    private void refreshKnobsFromNative() {
-        for (KnobBinding binding : knobBindings) {
-            int value = NativeBridge.nativeGetParameter(binding.spec.cc);
-            binding.knob.setValue(value);
-        }
-    }
-
-    private synchronized void startRealtimeAudio() {
-        if (!deviceReady || audioRunning)
-            return;
-
-        stopRealtimeAudio(false);
-
-        try {
-            int sampleRate = NativeBridge.nativeGetDeviceSampleRate();
-            if (sampleRate <= 0)
-                throw new IllegalStateException("Virus device has no valid sample rate.");
-
-            int minBuffer = AudioTrack.getMinBufferSize(
-                    sampleRate,
-                    AudioFormat.CHANNEL_OUT_STEREO,
-                    AudioFormat.ENCODING_PCM_FLOAT);
-
-            if (minBuffer <= 0)
-                throw new IllegalStateException(
-                        "AudioTrack rejected sample rate " + sampleRate + " Hz.");
-
-            int blockBytes = AUDIO_BLOCK_FRAMES * 2 * Float.BYTES;
-            int bufferBytes = Math.max(minBuffer * 2, blockBytes * 4);
-
-            AudioTrack track = new AudioTrack.Builder()
-                    .setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build())
-                    .setAudioFormat(new AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                            .setSampleRate(sampleRate)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                            .build())
-                    .setBufferSizeInBytes(bufferBytes)
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                    .build();
-
-            if (track.getState() != AudioTrack.STATE_INITIALIZED) {
-                track.release();
-                throw new IllegalStateException("AudioTrack could not initialize.");
-            }
-
-            realtimeTrack = track;
-            audioRunning = true;
-            NativeBridge.nativePanic();
-
-            track.play();
-
-            audioThread = new Thread(
-                    () -> runAudioLoop(track),
-                    "RiGear-Audio");
-            audioThread.start();
-
-            statusView.setText(
-                    "AUDIO RUNNING   " + sampleRate +
-                    " Hz   256 frames   SCREEN: KEEP ON");
-            updateControlState(false);
-        } catch (Throwable t) {
-            audioRunning = false;
-            cleanupAudioTrack();
-            statusView.setText("REALTIME AUDIO: FAILED");
-            detailsView.setText(t.getClass().getSimpleName() + ": " + t.getMessage());
-            updateControlState(false);
-        }
-    }
-
-    private void runAudioLoop(AudioTrack track) {
-        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
-        float[] block = new float[AUDIO_BLOCK_FRAMES * 2];
-
-        try {
-            while (audioRunning) {
-                int frames = NativeBridge.nativeProcessAudio(
-                        block,
-                        AUDIO_BLOCK_FRAMES);
-
-                if (frames != AUDIO_BLOCK_FRAMES)
-                    throw new IllegalStateException(
-                            "Native audio returned " + frames + " frames.");
-
-                int sampleCount = frames * 2;
-                int offset = 0;
-
-                while (audioRunning && offset < sampleCount) {
-                    int written = track.write(
-                            block,
-                            offset,
-                            sampleCount - offset,
-                            AudioTrack.WRITE_BLOCKING);
-
-                    if (written < 0)
-                        throw new IllegalStateException(
-                                "AudioTrack write failed: " + written);
-
-                    if (written > 0)
-                        offset += written;
+    private void chooseRom() {
+        midiGate = false;
+        work("Deteniendo audio para importar ROM...", () -> {
+            audio.stop();
+            ui.post(() -> {
+                if (!destroyed && visible) {
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE); intent.setType("*/*");
+                    startActivityForResult(intent, PICK_ROM);
                 }
-            }
-        } catch (Throwable t) {
-            String error = t.getClass().getSimpleName() + ": " + t.getMessage();
-            audioRunning = false;
-
-            runOnUiThread(() -> {
-                cleanupAudioTrack();
-                statusView.setText("REALTIME AUDIO: STOPPED BY ERROR");
-                detailsView.setText(error);
-                updateControlState(false);
             });
-        }
+        });
     }
-
-    private synchronized void stopRealtimeAudio(boolean showStatus) {
-        boolean wasRunning = audioRunning;
-        audioRunning = false;
-        NativeBridge.nativePanic();
-
-        AudioTrack track = realtimeTrack;
-
-        if (track != null) {
-            try {
-                track.pause();
-                track.flush();
-            } catch (Throwable ignored) {
+    @Override protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != PICK_ROM || result != RESULT_OK || data == null || data.getData() == null) return;
+        Uri uri = data.getData();
+        final int frames = chosen(BUFFERS, bufferChoice), clock = chosen(CLOCKS, clockChoice);
+        final int latency = chosen(LATENCIES, latencyChoice);
+        ready = false; bankCount = 0;
+        work("Leyendo firmware y bancos...", () -> {
+            audio.stop();
+            RomImporter.Bundle bundle = RomImporter.read(getApplicationContext(), uri);
+            String loaded = NativeBridge.nativeLoadRomBundle(bundle.data, bundle.names);
+            if (loaded == null || !loaded.contains("DSP BOOT: OK")) throw new IllegalStateException(loaded);
+            String config = RuntimeBridge.prepare(frames, clock, latency);
+            int banks = NativeBridge.nativeGetPatchBankCount();
+            String name = banks > 0 ? NativeBridge.nativeGetPatchName(0, 0) : "Sin bancos en ROM";
+            ui.post(() -> {
+                if (destroyed) return;
+                ready = true; bankCount = banks; bank = 0; program = 0;
+                problem = ""; status.setText("ROM lista. START para tocar.");
+                configuration.setText(config); showPatch(name); refreshPanel();
+            });
+        });
+    }
+    private void startAudio() {
+        final int frames = chosen(BUFFERS, bufferChoice), clock = chosen(CLOCKS, clockChoice);
+        final int latency = chosen(LATENCIES, latencyChoice), gain = chosen(GAINS, gainChoice);
+        work("Preparando audio Release...", () -> {
+            if (!visible || !ready) return;
+            audio.start(frames, clock, latency, gain);
+            // Stop may have been requested while native preparation was running.
+            if (!visible || destroyed) { audio.stop(); return; }
+            midiGate = true;
+            ui.post(() -> { if (!destroyed) { problem = ""; status.setText("Audio iniciado. Canal MIDI 1."); } });
+        });
+    }
+    private void stopAudio() {
+        midiGate = false; clearKeys();
+        work("Deteniendo...", () -> {
+            audio.stop();
+            ui.post(() -> { if (!destroyed) status.setText("Audio detenido; medidores conservados."); });
+        });
+    }
+    private void moveBank(int delta) {
+        if (bankCount <= 0 || busy) return;
+        bank = (bank + delta + bankCount) % bankCount; selectPatch();
+    }
+    private void movePatch(int delta) {
+        if (bankCount <= 0 || busy) return;
+        int n = ((bank * 128 + program + delta) % (bankCount * 128) + bankCount * 128) % (bankCount * 128);
+        bank = n / 128; program = n % 128; selectPatch();
+    }
+    private void selectPatch() {
+        final int b = bank, p = program;
+        work("Cambiando patch...", () -> {
+            String name = NativeBridge.nativeSelectPatch(b, p);
+            if (!audio.isRunning()) {
+                // Populate the stopped panel from the ROM; preparation preserves queued edits.
+                RuntimeBridge.prepare(chosen(BUFFERS, bufferChoice), chosen(CLOCKS, clockChoice), chosen(LATENCIES, latencyChoice));
             }
-        }
-
-        Thread thread = audioThread;
-        if (thread != null && thread != Thread.currentThread()) {
-            try {
-                thread.join(1000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-
-        int underruns = 0;
-
-        if (track != null) {
-            try {
-                underruns = track.getUnderrunCount();
-            } catch (Throwable ignored) {
-            }
-        }
-
-        cleanupAudioTrack();
-
-        for (Button key : keyboardButtons)
-            key.setPressed(false);
-
-        if (showStatus && wasRunning) {
-            statusView.setText(
-                    "AUDIO STOPPED   underruns: " + underruns +
-                    "   SCREEN: KEEP ON");
-        }
-
-        updateControlState(false);
+            RuntimeBridge.requestPanel();
+            ui.post(() -> { if (!destroyed) { showPatch(name); status.setText("Patch seleccionado"); refreshPanel(); } });
+        });
     }
-
-    private synchronized void cleanupAudioTrack() {
-        AudioTrack track = realtimeTrack;
-        realtimeTrack = null;
-        audioThread = null;
-
-        if (track != null) {
-            try {
-                if (track.getPlayState() == AudioTrack.PLAYSTATE_PLAYING)
-                    track.stop();
-            } catch (Throwable ignored) {
-            }
-
-            try {
-                track.release();
-            } catch (Throwable ignored) {
-            }
+    private void showPatch(String name) {
+        patch.setText(String.format(Locale.US, "%c %03d  %s", 'A' + bank, program + 1, name == null ? "" : name.trim()));
+    }
+    private void refreshPanel() {
+        if (!ready || !nativeReady || busy) return;
+        int[] values = RuntimeBridge.panel();
+        if (values == null || values.length != 257) return;
+        for (Binding binding : bindings) {
+            int index = 1 + binding.spec.index + (binding.spec.page == 0x71 ? 128 : 0);
+            binding.knob.showValue(values[index]);
         }
     }
-
-    private void panic() {
-        NativeBridge.nativePanic();
-
-        for (Button key : keyboardButtons)
-            key.setPressed(false);
-
-        statusView.setText("PANIC: ALL NOTES OFF   SCREEN: KEEP ON");
-    }
-
-    private void refreshMidiPorts() {
-        if (midiManager == null || destroyed)
-            return;
-
-        MidiPortChoice previous = getSelectedMidiChoice();
-
-        midiChoices.clear();
-
-        for (MidiDeviceInfo info : midiManager.getDevices()) {
-            String deviceName = buildMidiDeviceName(info);
-
-            for (MidiDeviceInfo.PortInfo port : info.getPorts()) {
-                if (port.getType() != MidiDeviceInfo.PortInfo.TYPE_OUTPUT)
-                    continue;
-
-                String portName = port.getName();
-                if (portName == null || portName.isEmpty())
-                    portName = "Out " + port.getPortNumber();
-
-                midiChoices.add(new MidiPortChoice(
-                        info,
-                        port.getPortNumber(),
-                        deviceName + " — " + portName));
-            }
+    private void refreshMonitor() {
+        long now = SystemClock.elapsedRealtime(), cpu = Process.getElapsedCpuTime();
+        if (wallTime != 0 && now > wallTime) cpuPercent = 100.0 * (cpu - cpuTime) / (now - wallTime);
+        wallTime = now; cpuTime = cpu;
+        RealtimeAudio.Session s = audio.session();
+        if (s != measuredSession) {
+            measuredSession = s; previousFrames = previousNanos = 0; underrunBase = 0;
         }
-
-        ArrayAdapter<MidiPortChoice> adapter =
-                (ArrayAdapter<MidiPortChoice>) midiSpinner.getAdapter();
-        adapter.notifyDataSetChanged();
-
-        if (previous != null) {
-            for (int i = 0; i < midiChoices.size(); ++i) {
-                MidiPortChoice c = midiChoices.get(i);
-                if (c.deviceInfo.getId() == previous.deviceInfo.getId() &&
-                        c.portNumber == previous.portNumber) {
-                    midiSpinner.setSelection(i);
-                    break;
-                }
-            }
-        }
-
-        if (midiChoices.isEmpty() && midiOutputPort == null)
-            midiStatsView.setText("USB MIDI: no input ports detected");
-
-        updateControlState(false);
+        if (s != null) {
+            long[] m = s.meter.snapshot();
+            long deltaFrames = m[1] - previousFrames, deltaNanos = m[2] - previousNanos;
+            if (deltaFrames > 0) renderPercent = 100.0 * deltaNanos * s.sampleRate / (deltaFrames * 1e9);
+            previousFrames = m[1]; previousNanos = m[2];
+            double budgetMs = 1000.0 * s.frames / s.sampleRate;
+            double peak = 100.0 * m[3] / (budgetMs * 1e6);
+            long[] signal = nativeReady ? RuntimeBridge.signalStats(false) : new long[]{0, 0, 0};
+            float audioPeak = Float.intBitsToFloat((int)signal[2]);
+            monitor.setText(String.format(Locale.US,
+                    "CPU app %.1f%% (100%% = 1 nucleo) | Render %.1f%% / max %.1f%%\nOV %d | Underruns %d | Peak %.3f | Clips %d | NaN/Inf %d",
+                    cpuPercent, renderPercent, peak, m[4], Math.max(0, s.underruns - underrunBase),
+                    audioPeak, signal[0], signal[1]));
+            configuration.setText(s.configuration + String.format(Locale.US,
+                    "\nBloque %d = %.2f ms | Cola Android REAL %d frames | %d Hz",
+                    s.frames, budgetMs, s.bufferFrames, s.sampleRate));
+            if (!s.error.isEmpty()) { problem = s.error; status.setText(problem); midiGate = false; }
+            monitor.setTextColor(m[4] > 0 || s.underruns > underrunBase ? 0xffffbd69 : Color.LTGRAY);
+        } else monitor.setText(String.format(Locale.US, "CPU app %.1f%% | Render — | OV 0 | Underruns 0", cpuPercent));
+        if (midi != null) midiStatus.setText(midi.status + "\n" + NativeBridge.nativeGetMidiStats());
     }
-
-    private String buildMidiDeviceName(MidiDeviceInfo info) {
-        Bundle props = info.getProperties();
-
-        String name = props.getString(MidiDeviceInfo.PROPERTY_NAME);
-        String manufacturer = props.getString(MidiDeviceInfo.PROPERTY_MANUFACTURER);
-        String product = props.getString(MidiDeviceInfo.PROPERTY_PRODUCT);
-
-        if (name != null && !name.isEmpty())
-            return name;
-
-        if (manufacturer != null && product != null)
-            return manufacturer + " " + product;
-
-        if (product != null && !product.isEmpty())
-            return product;
-
-        return "MIDI device " + info.getId();
+    private void resetMeters() {
+        RealtimeAudio.Session s = audio.session();
+        if (s != null) { s.meter.reset(); underrunBase = s.underruns; }
+        previousFrames = previousNanos = 0; renderPercent = 0;
+        if (nativeReady) RuntimeBridge.signalStats(true);
+        status.setText("Medidores reiniciados. OV = render tarda mas que su bloque, no voces del Virus.");
     }
-
-    private MidiPortChoice getSelectedMidiChoice() {
-        Object selected = midiSpinner != null ? midiSpinner.getSelectedItem() : null;
-        return selected instanceof MidiPortChoice ? (MidiPortChoice) selected : null;
+    private void controls() {
+        RealtimeAudio.Session s = audio.session();
+        boolean active = s != null && !s.finished && !s.stopRequested;
+        load.setEnabled(nativeReady && !busy);
+        start.setEnabled(ready && !busy && !active);
+        stop.setEnabled(!busy && active);
+        panic.setEnabled(ready && !busy);
+        for (Spinner choice : new Spinner[]{bufferChoice, clockChoice, latencyChoice, gainChoice}) choice.setEnabled(!busy && !active);
+        for (Button b : new Button[]{bankPrev, bankNext, prev, next}) b.setEnabled(ready && !busy && bankCount > 0);
+        sync.setEnabled(ready && !busy && active);
+        for (Binding binding : bindings) binding.knob.setEnabled(ready && !busy);
+        for (Button key : keys) key.setEnabled(midiGate && audio.isRunning() && !busy);
     }
-
-    private void connectSelectedMidi() {
-        if (midiManager == null)
-            return;
-
-        MidiPortChoice choice = getSelectedMidiChoice();
-        if (choice == null) {
-            midiStatsView.setText("USB MIDI: select a port first");
-            return;
-        }
-
-        closeMidiConnection(false);
-        midiStatsView.setText("USB MIDI: opening " + choice.label + "...");
-
-        midiManager.openDevice(
-                choice.deviceInfo,
-                device -> {
-                    if (destroyed) {
-                        if (device != null) {
-                            try {
-                                device.close();
-                            } catch (Throwable ignored) {
-                            }
-                        }
-                        return;
-                    }
-
-                    if (device == null) {
-                        midiStatsView.setText("USB MIDI: failed to open device");
-                        updateControlState(false);
-                        return;
-                    }
-
-                    MidiOutputPort port = device.openOutputPort(choice.portNumber);
-
-                    if (port == null) {
-                        try {
-                            device.close();
-                        } catch (Throwable ignored) {
-                        }
-
-                        midiStatsView.setText("USB MIDI: failed to open output port");
-                        updateControlState(false);
-                        return;
-                    }
-
-                    midiDevice = device;
-                    midiOutputPort = port;
-                    connectedChoice = choice;
-                    NativeBridge.nativeResetMidiStats();
-
-                    port.connect(midiReceiver);
-
-                    midiStatsView.setText("USB MIDI connected: " + choice.label);
-                    updateControlState(false);
-                },
-                uiHandler);
+    private void refreshMidiChoices() {
+        if (midi == null || destroyed) return;
+        midiChoices.clear(); midiChoices.addAll(midi.choices());
+        ArrayAdapter<MidiInput.Choice> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, midiChoices);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item); midiChoice.setAdapter(adapter);
     }
-
-    private void closeMidiConnection(boolean showStatus) {
-        NativeBridge.nativePanic();
-
-        MidiOutputPort port = midiOutputPort;
-        midiOutputPort = null;
-
-        if (port != null) {
-            try {
-                port.disconnect(midiReceiver);
-            } catch (Throwable ignored) {
-            }
-
-            try {
-                port.close();
-            } catch (Throwable ignored) {
-            }
-        }
-
-        MidiDevice device = midiDevice;
-        midiDevice = null;
-        connectedChoice = null;
-
-        if (device != null) {
-            try {
-                device.close();
-            } catch (Throwable ignored) {
-            }
-        }
-
-        NativeBridge.nativeResetMidiStats();
-
-        if (showStatus)
-            midiStatsView.setText("USB MIDI: disconnected");
-
-        updateControlState(false);
+    private void clearKeys() { for (Button key : keys) key.setPressed(false); }
+    private void showPage(int selected) {
+        for (int i = 0; i < pages.size(); ++i) pages.get(i).setVisibility(i == selected ? View.VISIBLE : View.GONE);
     }
-
-    private void updateControlState(boolean busy) {
-        loadRomButton.setEnabled(!busy);
-        selfTestButton.setEnabled(!busy && !audioRunning);
-
-        startAudioButton.setEnabled(!busy && deviceReady && !audioRunning);
-        stopAudioButton.setEnabled(!busy && audioRunning);
-        panicButton.setEnabled(!busy && audioRunning);
-
-        boolean browserEnabled = !busy && deviceReady && patchBankCount > 0;
-        bankPrevButton.setEnabled(browserEnabled);
-        bankNextButton.setEnabled(browserEnabled);
-        patchPrevButton.setEnabled(browserEnabled);
-        patchNextButton.setEnabled(browserEnabled);
-
-        for (KnobBinding binding : knobBindings)
-            binding.knob.setEnabled(!busy && deviceReady);
-
-        boolean keysEnabled = !busy && audioRunning;
-        for (Button key : keyboardButtons)
-            key.setEnabled(keysEnabled);
-
-        refreshMidiButton.setEnabled(!busy);
-        midiSpinner.setEnabled(!busy && midiOutputPort == null);
-        connectMidiButton.setEnabled(
-                !busy && midiOutputPort == null && !midiChoices.isEmpty());
-        disconnectMidiButton.setEnabled(!busy && midiOutputPort != null);
+    private int chosen(int[] choices, Spinner spinner) { return choices[Math.max(0, Math.min(choices.length - 1, spinner.getSelectedItemPosition()))]; }
+    private Spinner spinner(String[] values, int selection) {
+        Spinner s = new Spinner(this);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, values);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item); s.setAdapter(adapter); s.setSelection(selection); return s;
     }
-
-    private List<Candidate> extractCandidates(String selectedName, byte[] selectedData)
-            throws Exception {
-        String lower = selectedName.toLowerCase(Locale.ROOT);
-        List<Candidate> result = new ArrayList<>();
-
-        if (!lower.endsWith(".zip")) {
-            if (isFirmwareName(lower))
-                result.add(new Candidate(selectedName, selectedData));
-            else
-                throw new IllegalArgumentException(
-                        "Choose a .zip, .mid, .midi or .bin file.");
-
-            return result;
-        }
-
-        int totalUncompressed = 0;
-
-        try (ZipInputStream zin = new ZipInputStream(
-                new ByteArrayInputStream(selectedData))) {
-            ZipEntry entry;
-
-            while ((entry = zin.getNextEntry()) != null) {
-                if (entry.isDirectory()) {
-                    zin.closeEntry();
-                    continue;
-                }
-
-                String entryName = entry.getName();
-                String entryLower = entryName.toLowerCase(Locale.ROOT);
-
-                if (!isFirmwareName(entryLower)) {
-                    zin.closeEntry();
-                    continue;
-                }
-
-                byte[] bytes = readLimited(zin, MAX_FILE_BYTES);
-                totalUncompressed += bytes.length;
-
-                if (totalUncompressed > MAX_ARCHIVE_UNCOMPRESSED)
-                    throw new IllegalArgumentException(
-                            "ZIP expands beyond the 64 MB safety limit.");
-
-                result.add(new Candidate(entryName, bytes));
-                zin.closeEntry();
-            }
-        }
-
-        return result;
+    private void addSetting(LinearLayout parent, String name, Spinner spinner) {
+        LinearLayout setting = column(); setting.addView(text(name, 10)); setting.addView(spinner);
+        parent.addView(setting, new LinearLayout.LayoutParams(0, -2, 1));
     }
-
-    private boolean isFirmwareName(String lowerName) {
-        return lowerName.endsWith(".mid") ||
-               lowerName.endsWith(".midi") ||
-               lowerName.endsWith(".bin");
+    private int dp(int n) { return Math.round(n * getResources().getDisplayMetrics().density); }
+    private LinearLayout row() { LinearLayout l = new LinearLayout(this); l.setGravity(Gravity.CENTER); l.setOrientation(LinearLayout.HORIZONTAL); return l; }
+    private LinearLayout column() { LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL); return l; }
+    private TextView text(String value, int size) {
+        TextView v = new TextView(this); v.setText(value); v.setTextSize(size); v.setTextColor(Color.LTGRAY); v.setGravity(Gravity.CENTER); return v;
     }
-
-    private byte[] readUri(Uri uri, int maxBytes) throws Exception {
-        try (InputStream in = getContentResolver().openInputStream(uri)) {
-            if (in == null)
-                throw new IllegalStateException(
-                        "Android could not open the selected file.");
-
-            return readLimited(in, maxBytes);
-        }
+    private Button button(String label, View.OnClickListener listener) {
+        Button b = new Button(this); b.setText(label); b.setTextSize(10); b.setMinWidth(0); b.setMinimumWidth(0);
+        b.setMinHeight(0); b.setMinimumHeight(0); b.setPadding(dp(7), dp(4), dp(7), dp(4));
+        if (listener != null) b.setOnClickListener(listener); return b;
     }
-
-    private byte[] readLimited(InputStream in, int maxBytes) throws Exception {
-        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[8192];
-            int total = 0;
-            int n;
-
-            while ((n = in.read(buffer)) >= 0) {
-                total += n;
-
-                if (total > maxBytes)
-                    throw new IllegalArgumentException(
-                            "Selected file is larger than the safety limit.");
-
-                out.write(buffer, 0, n);
-            }
-
-            return out.toByteArray();
-        }
+    @Override protected void onStart() {
+        super.onStart(); visible = true;
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        wallTime = cpuTime = 0; ui.removeCallbacks(tick); ui.post(tick);
     }
-
-    private String getDisplayName(Uri uri) {
-        String result = "virus.bin";
-
-        try (Cursor cursor = getContentResolver().query(
-                uri,
-                new String[]{OpenableColumns.DISPLAY_NAME},
-                null,
-                null,
-                null)) {
-            if (cursor != null && cursor.moveToFirst()) {
-                int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
-
-                if (index >= 0) {
-                    String value = cursor.getString(index);
-
-                    if (value != null && !value.isEmpty())
-                        result = value;
-                }
-            }
-        } catch (Throwable ignored) {
-        }
-
-        return result;
+    @Override protected void onStop() {
+        visible = false; midiGate = false; clearKeys(); ui.removeCallbacks(tick);
+        // Do not attempt unattended background synthesis after manual locking/app switching.
+        ENGINE.execute(() -> {
+            try { audio.stop(); }
+            catch (Exception error) { ui.post(() -> { if (!destroyed) status.setText(error.toString()); }); }
+        });
+        super.onStop();
     }
-
-    @Override
-    protected void onDestroy() {
-        destroyed = true;
-        uiHandler.removeCallbacks(midiStatsUpdater);
-
-        if (midiManager != null) {
-            try {
-                midiManager.unregisterDeviceCallback(midiDeviceCallback);
-            } catch (Throwable ignored) {
-            }
-        }
-
-        closeMidiConnection(false);
-        stopRealtimeAudio(false);
-        NativeBridge.nativeRelease();
-        nativeExecutor.shutdown();
-
+    @Override protected void onDestroy() {
+        destroyed = true; visible = false; midiGate = false; ui.removeCallbacks(tick);
+        if (midi != null) midi.close();
+        ENGINE.execute(() -> {
+            try { audio.stop(); if (nativeReady) NativeBridge.nativeRelease(); }
+            catch (Exception error) { android.util.Log.e("RiGear", "Engine could not be safely released", error); }
+        });
         super.onDestroy();
     }
 }
