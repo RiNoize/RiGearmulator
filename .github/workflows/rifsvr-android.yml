@@ -29,6 +29,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: '11479570'
+          log-accepted-android-sdk-licenses: false
       - name: Prepare Android SDK
         run: |
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358'
@@ -39,6 +43,7 @@ jobs:
           echo '19a47985ae4491a3eeba2d37c45af38ca4b332a42238f2a645bef14eb590403f  rifsvr-android/project.tar.xz' | sha256sum -c -
           mkdir -p _rifsvr
           tar -xJf rifsvr-android/project.tar.xz -C _rifsvr
+          if test -f rifsvr-android/prepare.py; then python3 rifsvr-android/prepare.py _rifsvr; fi
           python3 _rifsvr/build.py --upstream "$GITHUB_WORKSPACE/_upstream_fsvr" --sdk "$ANDROID_HOME" 2>&1 | tee build-rifsvr.log
       - name: Upload APK, corresponding source and reports
         if: always()
