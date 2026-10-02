@@ -2,14 +2,6 @@ name: RiGear Android Core
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - android-rigear
-    paths:
-      - ".github/workflows/android-core.yml"
-      - "CMakeLists.txt"
-      - "source/**"
-      - ".gitmodules"
 
 permissions:
   contents: read
