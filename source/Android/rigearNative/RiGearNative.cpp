@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cctype>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -17,8 +18,42 @@
 
 namespace
 {
-std::mutex g_mutex;
+std::mutex g_deviceMutex;
+std::mutex g_midiMutex;
 std::unique_ptr<virusLib::Device> g_device;
+std::deque<synthLib::SMidiEvent> g_pendingMidi;
+
+std::array<std::vector<float>, 4> g_inputBuffers;
+std::array<std::vector<float>, 12> g_outputBuffers;
+std::vector<float> g_interleaved;
+
+void clearPendingMidi()
+{
+    std::lock_guard<std::mutex> lock(g_midiMutex);
+    g_pendingMidi.clear();
+}
+
+void ensureAudioScratch(const size_t frames)
+{
+    for (auto& b : g_inputBuffers)
+    {
+        if (b.size() != frames)
+            b.assign(frames, 0.0f);
+        else
+            std::fill(b.begin(), b.end(), 0.0f);
+    }
+
+    for (auto& b : g_outputBuffers)
+    {
+        if (b.size() != frames)
+            b.assign(frames, 0.0f);
+        else
+            std::fill(b.begin(), b.end(), 0.0f);
+    }
+
+    if (g_interleaved.size() != frames * 2)
+        g_interleaved.assign(frames * 2, 0.0f);
+}
 
 std::string getCoreInfo()
 {
@@ -230,8 +265,9 @@ Java_com_rinoize_rigear_NativeBridge_nativeLoadRom(
         params.romData = data;
         params.customData = static_cast<uint32_t>(model);
 
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::lock_guard<std::mutex> lock(g_deviceMutex);
         g_device.reset();
+        clearPendingMidi();
 
         auto device = std::make_unique<virusLib::Device>(params, false);
 
@@ -278,7 +314,7 @@ Java_com_rinoize_rigear_NativeBridge_nativeGetDeviceSampleRate(
     JNIEnv*,
     jclass)
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lock(g_deviceMutex);
     if (!g_device)
         return 0;
     return static_cast<jint>(std::lround(g_device->getSamplerate()));
@@ -292,7 +328,7 @@ Java_com_rinoize_rigear_NativeBridge_nativeRenderTestNote(
     jint velocity,
     jint durationMs)
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lock(g_deviceMutex);
 
     if (!g_device)
         return env->NewFloatArray(0);
@@ -390,11 +426,150 @@ Java_com_rinoize_rigear_NativeBridge_nativeRenderTestNote(
     return result;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeNoteOn(
+    JNIEnv*,
+    jclass,
+    jint note,
+    jint velocity)
+{
+    const int n = std::clamp(static_cast<int>(note), 0, 127);
+    const int v = std::clamp(static_cast<int>(velocity), 1, 127);
+
+    std::lock_guard<std::mutex> lock(g_midiMutex);
+    g_pendingMidi.emplace_back(
+        synthLib::MidiEventSource::Host,
+        synthLib::M_NOTEON,
+        static_cast<uint8_t>(n),
+        static_cast<uint8_t>(v),
+        0);
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeNoteOff(
+    JNIEnv*,
+    jclass,
+    jint note)
+{
+    const int n = std::clamp(static_cast<int>(note), 0, 127);
+
+    std::lock_guard<std::mutex> lock(g_midiMutex);
+    g_pendingMidi.emplace_back(
+        synthLib::MidiEventSource::Host,
+        synthLib::M_NOTEOFF,
+        static_cast<uint8_t>(n),
+        0,
+        0);
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativePanic(
+    JNIEnv*,
+    jclass)
+{
+    std::lock_guard<std::mutex> lock(g_midiMutex);
+    g_pendingMidi.clear();
+
+    for (int note = 0; note < 128; ++note)
+    {
+        g_pendingMidi.emplace_back(
+            synthLib::MidiEventSource::Host,
+            synthLib::M_NOTEOFF,
+            static_cast<uint8_t>(note),
+            0,
+            0);
+    }
+
+    g_pendingMidi.emplace_back(
+        synthLib::MidiEventSource::Host,
+        synthLib::M_CONTROLCHANGE,
+        synthLib::MC_ALLSOUNDOFF,
+        0,
+        0);
+
+    g_pendingMidi.emplace_back(
+        synthLib::MidiEventSource::Host,
+        synthLib::M_CONTROLCHANGE,
+        synthLib::MC_ALLNOTESOFF,
+        0,
+        0);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeProcessAudio(
+    JNIEnv* env,
+    jclass,
+    jfloatArray output,
+    jint frames)
+{
+    if (!output || frames <= 0 || frames > 2048)
+        return 0;
+
+    const auto frameCount = static_cast<size_t>(frames);
+    if (env->GetArrayLength(output) < frames * 2)
+        return 0;
+
+    std::lock_guard<std::mutex> deviceLock(g_deviceMutex);
+
+    if (!g_device)
+        return 0;
+
+    ensureAudioScratch(frameCount);
+
+    synthLib::TAudioInputs inputs{};
+    synthLib::TAudioOutputs outputs{};
+
+    for (size_t i = 0; i < g_inputBuffers.size(); ++i)
+        inputs[i] = g_inputBuffers[i].data();
+
+    for (size_t i = 0; i < g_outputBuffers.size(); ++i)
+        outputs[i] = g_outputBuffers[i].data();
+
+    thread_local std::vector<synthLib::SMidiEvent> midiIn;
+    thread_local std::vector<synthLib::SMidiEvent> midiOut;
+    midiIn.clear();
+    midiOut.clear();
+
+    {
+        std::lock_guard<std::mutex> midiLock(g_midiMutex);
+        if (midiIn.capacity() < g_pendingMidi.size())
+            midiIn.reserve(g_pendingMidi.size());
+
+        while (!g_pendingMidi.empty())
+        {
+            midiIn.emplace_back(std::move(g_pendingMidi.front()));
+            g_pendingMidi.pop_front();
+        }
+    }
+
+    g_device->process(inputs, outputs, frameCount, midiIn, midiOut);
+
+    const auto* left = g_outputBuffers[0].data();
+    const auto* right = g_outputBuffers[1].data();
+
+    for (size_t i = 0; i < frameCount; ++i)
+    {
+        g_interleaved[i * 2] = std::clamp(left[i], -1.0f, 1.0f);
+        g_interleaved[i * 2 + 1] = std::clamp(right[i], -1.0f, 1.0f);
+    }
+
+    env->SetFloatArrayRegion(
+        output,
+        0,
+        static_cast<jsize>(frameCount * 2),
+        g_interleaved.data());
+
+    return frames;
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_rinoize_rigear_NativeBridge_nativeRelease(
     JNIEnv*,
     jclass)
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lock(g_deviceMutex);
     g_device.reset();
+    clearPendingMidi();
 }
