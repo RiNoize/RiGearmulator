@@ -1,0 +1,82 @@
+name: RiGear Android Core
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - android-rigear
+    paths:
+      - ".github/workflows/android-core.yml"
+      - "CMakeLists.txt"
+      - "source/**"
+      - ".gitmodules"
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: "27.2.12479018"
+  BUILD_DIR: "build/android-core"
+
+jobs:
+  osirus-arm64-core:
+    name: Osirus core (arm64-v8a)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout RiGearmulator
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          sdkmanager "ndk;${NDK_VERSION}"
+
+      - name: Configure Gearmulator for Android ARM64
+        shell: bash
+        run: |
+          cmake -S . -B "${BUILD_DIR}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-21 \
+            -DANDROID_ARM_NEON=TRUE \
+            -DANDROID_STL=c++_shared \
+            -DBUILD_TESTING=OFF \
+            -Dgearmulator_BUILD_JUCEPLUGIN=OFF \
+            -Dgearmulator_SYNTH_OSIRUS=ON \
+            -Dgearmulator_SYNTH_OSTIRUS=OFF \
+            -Dgearmulator_SYNTH_VAVRA=OFF \
+            -Dgearmulator_SYNTH_XENIA=OFF \
+            -Dgearmulator_SYNTH_NODALRED2X=OFF \
+            -Dgearmulator_SYNTH_JE8086=OFF \
+            -Dgearmulator_SYNTH_88EMU=OFF \
+            -Dgearmulator_COMPONENT_DSPBRIDGE=OFF
+
+      - name: Build Osirus core
+        shell: bash
+        run: |
+          cmake --build "${BUILD_DIR}" --target virusLib --config Release --parallel 3
+
+      - name: Collect native libraries
+        if: success()
+        shell: bash
+        run: |
+          mkdir -p artifacts/arm64-v8a
+          find "${BUILD_DIR}" -type f -name "*.a" -print -exec cp {} artifacts/arm64-v8a/ \;
+          echo "Collected libraries:"
+          ls -lh artifacts/arm64-v8a
+
+      - name: Upload ARM64 core
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rigear-osirus-core-arm64
+          path: artifacts/arm64-v8a/
+          if-no-files-found: error
