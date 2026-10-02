@@ -65,24 +65,24 @@ jobs:
             -Dgearmulator_SYNTH_88EMU=OFF \
             -Dgearmulator_COMPONENT_DSPBRIDGE=OFF
 
-      - name: Build Osirus core
+      - name: Build RiGear JNI shared library
         shell: bash
         run: |
-          cmake --build "${BUILD_DIR}" --target virusLib --config Release --parallel 3
+          cmake --build "${BUILD_DIR}" --target rigear_jni --config Release --parallel 3
 
-      - name: Collect native libraries
+      - name: Collect Android shared library
         if: success()
         shell: bash
         run: |
           mkdir -p artifacts/arm64-v8a
-          find "${BUILD_DIR}" -type f -name "*.a" -print -exec cp {} artifacts/arm64-v8a/ \;
-          echo "Collected libraries:"
+          find "${BUILD_DIR}" -type f -name "librigear.so" -print -exec cp {} artifacts/arm64-v8a/ \;
+          echo "Collected Android library:"
           ls -lh artifacts/arm64-v8a
 
-      - name: Upload ARM64 core
+      - name: Upload RiGear ARM64 JNI
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rigear-osirus-core-arm64
-          path: artifacts/arm64-v8a/
+          name: rigear-jni-arm64
+          path: artifacts/arm64-v8a/librigear.so
           if-no-files-found: error
