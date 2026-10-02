@@ -37,6 +37,17 @@ set(BUILD_SHARED_LIBS OFF)
 
 add_subdirectory(cpu/dsp56300/source)
 
+# Android folds POSIX realtime functions into libc and has no separate librt.
+# The dsp56300 submodule links dsp56kBase against "rt" on generic UNIX hosts,
+# so remove that propagated dependency for Android without modifying upstream.
+if(ANDROID AND TARGET dsp56kBase)
+	get_target_property(_rigear_dsp56kbase_links dsp56kBase INTERFACE_LINK_LIBRARIES)
+	if(_rigear_dsp56kbase_links)
+		list(REMOVE_ITEM _rigear_dsp56kbase_links rt)
+		set_property(TARGET dsp56kBase PROPERTY INTERFACE_LINK_LIBRARIES "${_rigear_dsp56kbase_links}")
+	endif()
+endif()
+
 # ----------------- Common libraries used by all synths
 
 add_subdirectory(framework/baseLib)
