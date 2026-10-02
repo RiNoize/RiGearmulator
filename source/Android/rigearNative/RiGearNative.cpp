@@ -27,6 +27,186 @@ std::array<std::vector<float>, 4> g_inputBuffers;
 std::array<std::vector<float>, 12> g_outputBuffers;
 std::vector<float> g_interleaved;
 
+uint8_t g_runningStatus = 0;
+uint8_t g_midiData[2] = {0, 0};
+uint8_t g_midiDataCount = 0;
+uint8_t g_midiDataNeeded = 0;
+bool g_inSysex = false;
+
+uint64_t g_externalMessageCount = 0;
+uint64_t g_externalNoteOnCount = 0;
+uint64_t g_externalNoteOffCount = 0;
+uint32_t g_externalActiveNoteCount = 0;
+std::array<bool, 16 * 128> g_externalActiveNotes{};
+
+void resetMidiParserState()
+{
+    g_runningStatus = 0;
+    g_midiData[0] = 0;
+    g_midiData[1] = 0;
+    g_midiDataCount = 0;
+    g_midiDataNeeded = 0;
+    g_inSysex = false;
+}
+
+void resetExternalMidiStatsLocked()
+{
+    g_externalMessageCount = 0;
+    g_externalNoteOnCount = 0;
+    g_externalNoteOffCount = 0;
+    g_externalActiveNoteCount = 0;
+    g_externalActiveNotes.fill(false);
+    resetMidiParserState();
+}
+
+void clearActiveNotesForChannel(const uint8_t channel)
+{
+    const size_t base = static_cast<size_t>(channel) * 128;
+    for (size_t note = 0; note < 128; ++note)
+    {
+        auto& active = g_externalActiveNotes[base + note];
+        if (active)
+        {
+            active = false;
+            if (g_externalActiveNoteCount > 0)
+                --g_externalActiveNoteCount;
+        }
+    }
+}
+
+void updateExternalStatsForMessage(
+    const uint8_t status,
+    const uint8_t data1,
+    const uint8_t data2)
+{
+    ++g_externalMessageCount;
+
+    const uint8_t type = status & 0xf0;
+    const uint8_t channel = status & 0x0f;
+
+    if (type == synthLib::M_NOTEON && data2 != 0)
+    {
+        ++g_externalNoteOnCount;
+        auto& active = g_externalActiveNotes[
+            static_cast<size_t>(channel) * 128 + data1];
+
+        if (!active)
+        {
+            active = true;
+            ++g_externalActiveNoteCount;
+        }
+    }
+    else if (type == synthLib::M_NOTEOFF ||
+             (type == synthLib::M_NOTEON && data2 == 0))
+    {
+        ++g_externalNoteOffCount;
+        auto& active = g_externalActiveNotes[
+            static_cast<size_t>(channel) * 128 + data1];
+
+        if (active)
+        {
+            active = false;
+            if (g_externalActiveNoteCount > 0)
+                --g_externalActiveNoteCount;
+        }
+    }
+    else if (type == synthLib::M_CONTROLCHANGE &&
+             (data1 == synthLib::MC_ALLNOTESOFF ||
+              data1 == synthLib::MC_ALLSOUNDOFF))
+    {
+        clearActiveNotesForChannel(channel);
+    }
+}
+
+void enqueueExternalChannelMessage(
+    const uint8_t status,
+    const uint8_t data1,
+    const uint8_t data2)
+{
+    updateExternalStatsForMessage(status, data1, data2);
+
+    g_pendingMidi.emplace_back(
+        synthLib::MidiEventSource::Physical,
+        status,
+        data1,
+        data2,
+        0);
+}
+
+void parseExternalMidiBytes(const uint8_t* data, const size_t size)
+{
+    for (size_t i = 0; i < size; ++i)
+    {
+        const uint8_t byte = data[i];
+
+        // MIDI realtime may appear between any two bytes and does not alter
+        // running status. The Virus handles clock later; ignore it in this
+        // first USB-MIDI validation build.
+        if (byte >= 0xf8)
+            continue;
+
+        if (byte & 0x80)
+        {
+            if (byte == 0xf0)
+            {
+                g_inSysex = true;
+                g_runningStatus = 0;
+                g_midiDataCount = 0;
+                continue;
+            }
+
+            if (byte == 0xf7)
+            {
+                g_inSysex = false;
+                g_runningStatus = 0;
+                g_midiDataCount = 0;
+                continue;
+            }
+
+            if (byte >= 0xf0)
+            {
+                // System common messages are not needed for the first MIDI
+                // keyboard test. They cancel channel running status.
+                g_inSysex = false;
+                g_runningStatus = 0;
+                g_midiDataCount = 0;
+                g_midiDataNeeded = 0;
+                continue;
+            }
+
+            g_inSysex = false;
+            g_runningStatus = byte;
+            g_midiDataCount = 0;
+
+            const uint8_t type = byte & 0xf0;
+            g_midiDataNeeded =
+                (type == synthLib::M_PROGRAMCHANGE ||
+                 type == synthLib::M_AFTERTOUCH) ? 1 : 2;
+            continue;
+        }
+
+        if (g_inSysex || g_runningStatus == 0 || g_midiDataNeeded == 0)
+            continue;
+
+        if (g_midiDataCount < 2)
+            g_midiData[g_midiDataCount++] = byte & 0x7f;
+
+        if (g_midiDataCount >= g_midiDataNeeded)
+        {
+            const uint8_t data1 = g_midiData[0];
+            const uint8_t data2 =
+                g_midiDataNeeded > 1 ? g_midiData[1] : 0;
+
+            enqueueExternalChannelMessage(
+                g_runningStatus,
+                data1,
+                data2);
+
+            g_midiDataCount = 0;
+        }
+    }
+}
+
 void clearPendingMidi()
 {
     std::lock_guard<std::mutex> lock(g_midiMutex);
@@ -268,6 +448,10 @@ Java_com_rinoize_rigear_NativeBridge_nativeLoadRom(
         std::lock_guard<std::mutex> lock(g_deviceMutex);
         g_device.reset();
         clearPendingMidi();
+        {
+            std::lock_guard<std::mutex> midiLock(g_midiMutex);
+            resetExternalMidiStatsLocked();
+        }
 
         auto device = std::make_unique<virusLib::Device>(params, false);
 
@@ -495,6 +679,62 @@ Java_com_rinoize_rigear_NativeBridge_nativePanic(
         synthLib::MC_ALLNOTESOFF,
         0,
         0);
+
+    g_externalActiveNotes.fill(false);
+    g_externalActiveNoteCount = 0;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeSendMidiBytes(
+    JNIEnv* env,
+    jclass,
+    jbyteArray bytes,
+    jint offset,
+    jint count)
+{
+    if (!bytes || offset < 0 || count <= 0)
+        return JNI_FALSE;
+
+    const jsize length = env->GetArrayLength(bytes);
+    if (offset > length || count > length - offset)
+        return JNI_FALSE;
+
+    std::vector<uint8_t> data(static_cast<size_t>(count));
+    env->GetByteArrayRegion(
+        bytes,
+        offset,
+        count,
+        reinterpret_cast<jbyte*>(data.data()));
+
+    std::lock_guard<std::mutex> lock(g_midiMutex);
+    parseExternalMidiBytes(data.data(), data.size());
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeResetMidiStats(
+    JNIEnv*,
+    jclass)
+{
+    std::lock_guard<std::mutex> lock(g_midiMutex);
+    resetExternalMidiStatsLocked();
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_rigear_NativeBridge_nativeGetMidiStats(
+    JNIEnv* env,
+    jclass)
+{
+    std::lock_guard<std::mutex> lock(g_midiMutex);
+
+    std::ostringstream out;
+    out << "USB MIDI messages: " << g_externalMessageCount
+        << "   Note On: " << g_externalNoteOnCount
+        << "   Note Off: " << g_externalNoteOffCount
+        << "   Active: " << g_externalActiveNoteCount;
+
+    const auto s = out.str();
+    return env->NewStringUTF(s.c_str());
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -572,4 +812,8 @@ Java_com_rinoize_rigear_NativeBridge_nativeRelease(
     std::lock_guard<std::mutex> lock(g_deviceMutex);
     g_device.reset();
     clearPendingMidi();
+    {
+        std::lock_guard<std::mutex> midiLock(g_midiMutex);
+        resetExternalMidiStatsLocked();
+    }
 }

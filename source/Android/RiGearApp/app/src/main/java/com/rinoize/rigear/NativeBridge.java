@@ -18,5 +18,9 @@ public final class NativeBridge {
     public static native void nativePanic();
     public static native int nativeProcessAudio(float[] stereoBuffer, int frames);
 
+    public static native boolean nativeSendMidiBytes(byte[] data, int offset, int count);
+    public static native void nativeResetMidiStats();
+    public static native String nativeGetMidiStats();
+
     public static native void nativeRelease();
 }
