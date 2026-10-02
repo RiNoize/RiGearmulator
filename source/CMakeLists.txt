@@ -205,3 +205,9 @@ add_subdirectory(claudia)
 # ----------------- all ronaldos
 
 add_subdirectory(ronaldo)
+
+# ----------------- RiGear Android native bridge
+
+if(ANDROID)
+	add_subdirectory(Android/rigearNative EXCLUDE_FROM_ALL)
+endif()
