@@ -1,32 +1,25 @@
-plugins {
-    id 'com.android.application'
-}
+plugins { id 'com.android.application' }
 
 android {
     namespace 'com.rinoize.rigear'
     compileSdk 35
     ndkVersion '27.2.12479018'
-
     defaultConfig {
         applicationId 'com.rinoize.rigear'
         minSdk 26
         targetSdk 35
-        versionCode 8
-        versionName '0.7.0'
+        versionCode 9
+        versionName '0.8.0'
         ndk { abiFilters 'arm64-v8a' }
     }
-
-    // Native code is built explicitly in Release by android-apk.yml and copied
-    // into jniLibs. This avoids silently compiling the DSP as CMake Debug.
+    // android-apk.yml builds all native code in Release before Gradle packages it.
     sourceSets { main { jniLibs.srcDirs = ['src/main/jniLibs'] } }
-
     buildTypes {
         debug { debuggable true }
         release {
             debuggable false
             minifyEnabled false
-            // Test APK for direct installation only, not a production signing key.
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.debug // Direct-install test APK, not a production key.
         }
     }
     compileOptions {

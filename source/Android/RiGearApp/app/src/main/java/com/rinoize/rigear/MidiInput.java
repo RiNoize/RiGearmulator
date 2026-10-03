@@ -11,8 +11,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.BooleanSupplier;
 
-/** Android MIDI output ports are the hardware's outputs, hence this app's inputs. */
+/** Hardware output ports are this app's MIDI inputs. */
 public final class MidiInput implements AutoCloseable {
+    public final MidiTelemetry telemetry = new MidiTelemetry();
     public static final class Choice {
         final MidiDeviceInfo info; final int port; final String name;
         Choice(MidiDeviceInfo info, int port, String name) { this.info = info; this.port = port; this.name = name; }
@@ -36,7 +37,7 @@ public final class MidiInput implements AutoCloseable {
         }
     };
     public MidiInput(Context context, Handler handler, BooleanSupplier enabled, Runnable changed) {
-        this.manager = (MidiManager) context.getSystemService(Context.MIDI_SERVICE);
+        manager = (MidiManager) context.getSystemService(Context.MIDI_SERVICE);
         this.handler = handler; this.enabled = enabled; this.changed = changed;
         if (manager != null) manager.registerDeviceCallback(callback, handler);
         else status = "Android MIDI no disponible";
@@ -68,14 +69,15 @@ public final class MidiInput implements AutoCloseable {
             MidiOutputPort output = opened.openOutputPort(choice.port);
             if (output == null) { safeClose(opened); status = "Puerto MIDI no disponible"; return; }
             device = opened; port = output; selected = choice;
-            NativeBridge.nativeResetMidiStats();
+            NativeBridge.nativeResetMidiStats(); telemetry.reset(true);
             output.connect(new MidiReceiver() {
                 @Override public void onSend(byte[] data, int offset, int count, long timestamp) {
                     if (token != generation || !enabled.getAsBoolean()) return;
-                    NativeBridge.nativeSendMidiBytes(data, offset, count);
+                    if (NativeBridge.nativeSendMidiBytes(data, offset, count))
+                        telemetry.accept(data, offset, count);
                 }
             });
-            status = "MIDI: " + choice.name + " (usar canal 1)";
+            status = "MIDI: " + choice.name + " | canal 1";
         }, handler);
     }
     public void disconnect() {
@@ -84,6 +86,7 @@ public final class MidiInput implements AutoCloseable {
         try { if (old != null) old.close(); } catch (Exception ignored) {}
         safeClose(device); device = null;
         if (enabled.getAsBoolean()) RuntimeBridge.panic();
+        telemetry.reset(true);
         status = "MIDI desconectado";
     }
     private static void safeClose(MidiDevice device) {
