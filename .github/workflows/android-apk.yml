@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: read
-
 concurrency:
   group: rigear-apk-${{ github.ref }}
   cancel-in-progress: true
@@ -23,7 +22,7 @@ env:
 
 jobs:
   build-apk:
-    name: RiGear 0.8 latency ARM64 APK
+    name: RiGear 0.9 48kHz ARM64 APK
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -37,6 +36,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Test native streaming sample-rate converter
+        shell: bash
+        run: |
+          mkdir -p build/src-tests artifacts
+          clang++ -std=c++17 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
+            -I source/Android/rigearNative source/Android/RiGearApp/tests/ResamplerTest.cpp \
+            -o build/src-tests/resampler-test
+          build/src-tests/resampler-test | tee artifacts/src-tests.txt
       - name: Prepare Android SDK
         shell: bash
         run: |
@@ -47,7 +54,7 @@ jobs:
       - name: Test render, queue and sustain diagnostics
         shell: bash
         run: |
-          mkdir -p build/meter-tests artifacts
+          mkdir -p build/meter-tests
           JAVA_SRC=source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear
           javac -d build/meter-tests \
             "$JAVA_SRC/RenderMeter.java" "$JAVA_SRC/PlaybackQueueMeter.java" \
@@ -77,7 +84,7 @@ jobs:
             -Dgearmulator_SYNTH_VAVRA=OFF -Dgearmulator_SYNTH_XENIA=OFF \
             -Dgearmulator_SYNTH_NODALRED2X=OFF -Dgearmulator_SYNTH_JE8086=OFF \
             -Dgearmulator_SYNTH_88EMU=OFF -Dgearmulator_COMPONENT_DSPBRIDGE=OFF
-      - name: Verify optimized native build configuration
+      - name: Verify Release and independent sample-rate accounting
         shell: bash
         run: |
           python3 - <<'PY'
@@ -96,10 +103,19 @@ jobs:
           runtime = pathlib.Path('source/Android/rigearNative/RiGearRuntime.cpp').read_text()
           assert 'setExtraLatencySamples(static_cast<uint32_t>(extraFrames))' in runtime
           assert 'frames * extraBlocks' not in runtime
+          java = pathlib.Path('source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear')
+          output = (java / 'RealtimeAudio.java').read_text()
+          ui = (java / 'MainActivity.java').read_text()
+          assert 's.frames, s.deviceSampleRate' in output
+          assert 'final int sampleCount = rendered * 2' in output
+          assert 'sampleCount - offset' in output
+          assert 'm, s.deviceSampleRate' in ui
+          assert 'o.queuedFrames * 1000.0 / s.sampleRate' in ui
           pathlib.Path('artifacts/native-build.json').write_text(json.dumps({
-              'version': '0.8.0', 'commit': os.environ['GITHUB_SHA'], 'build_type': 'Release',
-              'ndk': os.environ['NDK_VERSION'], 'commands': selected}, indent=2))
-          print('Verified Release/NDEBUG; extra DSP latency uses absolute frames')
+              'version': '0.9.0', 'commit': os.environ['GITHUB_SHA'], 'build_type': 'Release',
+              'ndk': os.environ['NDK_VERSION'], 'src_ratio': '128/125', 'src_taps': 96,
+              'commands': selected}, indent=2))
+          print('Verified Release/NDEBUG; native render deadlines and output queue use their own sample rates')
           PY
       - name: Build native shared library
         shell: bash
@@ -120,24 +136,24 @@ jobs:
       - name: Verify APK and collect report
         shell: bash
         run: |
-          cp source/Android/RiGearApp/app/build/outputs/apk/release/app-release.apk artifacts/RiGear-0.8-arm64.apk
-          "${ANDROID_HOME}/build-tools/35.0.0/aapt" dump badging artifacts/RiGear-0.8-arm64.apk > artifacts/apk-info.txt
+          cp source/Android/RiGearApp/app/build/outputs/apk/release/app-release.apk artifacts/RiGear-0.9-arm64.apk
+          "${ANDROID_HOME}/build-tools/35.0.0/aapt" dump badging artifacts/RiGear-0.9-arm64.apk > artifacts/apk-info.txt
           python3 - <<'PY'
           import zipfile, pathlib
-          with zipfile.ZipFile('artifacts/RiGear-0.8-arm64.apk') as apk:
+          with zipfile.ZipFile('artifacts/RiGear-0.9-arm64.apk') as apk:
               assert 'lib/arm64-v8a/librigear.so' in apk.namelist()
               assert 'classes.dex' in apk.namelist()
           info = pathlib.Path('artifacts/apk-info.txt').read_text()
-          assert "versionName='0.8.0'" in info and "versionCode='9'" in info
-          print('APK: version 0.8.0 / code 9 / Java UI and ARM64 engine verified')
+          assert "versionName='0.9.0'" in info and "versionCode='10'" in info
+          print('APK: 0.9.0 / code 10 / Java UI and ARM64 engine verified')
           PY
-          cp source/Android/RiGearApp/TESTING-0.8.md artifacts/
-          echo '### RiGear 0.8' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Release verified; queue/wrap/OV-rate/sustain unit tests and Android Java compilation passed.' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Audio latency, sound and hardware MIDI must still be tested on the tablet.' >> "$GITHUB_STEP_SUMMARY"
+          cp source/Android/RiGearApp/TESTING-0.9.md artifacts/
+          echo '### RiGear 0.9' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Release verified; SRC ASan/UBSan and waveform tests, MIDI/queue/deadline tests and Java API check passed.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No tablet runtime/latency test is claimed. Nativa bypass remains available.' >> "$GITHUB_STEP_SUMMARY"
       - name: Upload RiGear APK
         uses: actions/upload-artifact@v4
         with:
-          name: RiGear-0.8-latency-arm64
+          name: RiGear-0.9-48kHz-arm64
           path: artifacts/
           if-no-files-found: error

@@ -1,6 +1,8 @@
 // Single translation unit: preserve the ROM/MIDI/device implementation.
 #include "RiGearNative.cpp"
+#include "RationalResampler.h"
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
@@ -10,6 +12,11 @@ float rgAppliedGain = 1.0f;
 std::atomic<uint64_t> rgClips{0}, rgBad{0}, rgPeakBits{0}, rgRevision{1};
 std::array<int, 128> rgPageB{};
 std::atomic<bool> rgRequestPatch{true};
+// Access streaming conversion state only while holding g_deviceMutex.
+bool rgConvert48 = false;
+rigear::RationalResampler rgSrc;
+std::vector<float> rgConverted;
+std::atomic<uint64_t> rgSrcNanos{0}, rgSrcMaxNanos{0}, rgSrcInputs{0}, rgSrcOutputs{0};
 
 synthLib::SMidiEvent rgSysex(std::initializer_list<uint8_t> bytes) {
     synthLib::SMidiEvent event(synthLib::MidiEventSource::Editor);
@@ -52,7 +59,6 @@ Java_com_rinoize_rigear_RuntimeBridge_prepare(JNIEnv* env, jclass, jint frames,
         if (clockPercent != 50 && clockPercent != 75 && clockPercent != 100 &&
             clockPercent != 125 && clockPercent != 150 && clockPercent != 200)
             throw std::invalid_argument("Unsupported DSP clock setting");
-        // 0.8: absolute frames, deliberately independent of the render block.
         if (extraFrames != 0 && extraFrames != 128 && extraFrames != 256 &&
             extraFrames != 512 && extraFrames != 1024 && extraFrames != 2048 &&
             extraFrames != 4096 && extraFrames != 8192)
@@ -63,6 +69,9 @@ Java_com_rinoize_rigear_RuntimeBridge_prepare(JNIEnv* env, jclass, jint frames,
             throw std::runtime_error("Device rejected DSP clock");
         g_device->setExtraLatencySamples(static_cast<uint32_t>(extraFrames));
         ensureAudioScratch(static_cast<size_t>(frames));
+        rgConvert48 = false;
+        rgSrc.reset();
+        rgSrcNanos.store(0); rgSrcMaxNanos.store(0); rgSrcInputs.store(0); rgSrcOutputs.store(0);
         rgAppliedGain = rgGain.load();
         rgClips.store(0); rgBad.store(0); rgPeakBits.store(0);
         rgCacheRomPageB();
@@ -79,23 +88,47 @@ Java_com_rinoize_rigear_RuntimeBridge_prepare(JNIEnv* env, jclass, jint frames,
 #endif
         out << " | DSP " << g_device->getDspClockPercent() << "% / "
             << formatHz(g_device->getDspClockHz()) << " | Extra DSP "
-            << g_device->getExtraLatencySamples() << " frames";
+            << g_device->getExtraLatencySamples() << " frames Virus";
         return env->NewStringUTF(out.str().c_str());
     } catch (const std::exception& error) { rgThrow(env, error.what()); }
       catch (...) { rgThrow(env, "Native audio preparation failed"); }
     return nullptr;
 }
 
+// Called by the serialized control executor AFTER prepare, BEFORE the audio worker.
+extern "C" JNIEXPORT void JNICALL
+Java_com_rinoize_rigear_RuntimeBridge_configureOutput(JNIEnv* env, jclass, jint outputRate) {
+    try {
+        std::lock_guard<std::mutex> lock(g_deviceMutex);
+        if (!g_device || g_interleaved.empty()) throw std::runtime_error("Prepare the device first");
+        const double nativeRate = g_device->getSamplerate();
+        rgConvert48 = false;
+        if (outputRate == static_cast<jint>(std::lround(nativeRate))) return;
+        if (outputRate != 48000 || std::abs(nativeRate - 46875.0) > 0.001)
+            throw std::invalid_argument("48 kHz SRC requires a 46875 Hz Virus. Use Nativa for this ROM.");
+        rgSrc.prepare();
+        rgConverted.assign(rigear::RationalResampler::maxOutputFrames(g_interleaved.size()/2)*2, 0.0f);
+        rgConvert48 = true;
+    } catch (const std::exception& error) { rgThrow(env, error.what()); }
+      catch (...) { rgThrow(env, "Could not prepare sample-rate conversion"); }
+}
+
+// Returns OUTPUT frames; native input frames are unchanged. At 48k this is variable
+// (e.g. 262/263 for a 256-frame input). There is just one JNI audio copy, after SRC.
 extern "C" JNIEXPORT jint JNICALL
 Java_com_rinoize_rigear_RuntimeBridge_render(JNIEnv* env, jclass, jfloatArray buffer, jint frames) {
     try {
-        if (!buffer || (frames != 256 && frames != 512 && frames != 1024) ||
-            env->GetArrayLength(buffer) < frames * 2)
+        if (!buffer || (frames != 256 && frames != 512 && frames != 1024))
             throw std::invalid_argument("Invalid stereo render buffer");
         std::lock_guard<std::mutex> lock(g_deviceMutex);
         if (!g_device) throw std::runtime_error("Device is not loaded");
         if (g_interleaved.size() != static_cast<size_t>(frames * 2))
             throw std::runtime_error("Call prepare before changing buffer size");
+        const size_t maxOutput = rgConvert48 ? rigear::RationalResampler::maxOutputFrames(frames) : static_cast<size_t>(frames);
+        if (static_cast<size_t>(env->GetArrayLength(buffer)) < maxOutput * 2)
+            throw std::invalid_argument("Java output array too small for selected sample rate");
+        if (rgConvert48 && std::abs(g_device->getSamplerate() - 46875.0) > 0.001)
+            throw std::runtime_error("Virus sample rate changed. Stop and restart with Nativa.");
         synthLib::TAudioInputs inputs{};
         synthLib::TAudioOutputs outputs{};
         for (size_t i = 0; i < g_inputBuffers.size(); ++i) inputs[i] = g_inputBuffers[i].data();
@@ -151,14 +184,31 @@ Java_com_rinoize_rigear_RuntimeBridge_render(JNIEnv* env, jclass, jfloatArray bu
         rgBad.fetch_add(bad, std::memory_order_relaxed);
         uint32_t peakBits; std::memcpy(&peakBits, &peak, sizeof(peakBits));
         rgPeakBits.store(peakBits, std::memory_order_relaxed);
-        env->SetFloatArrayRegion(buffer, 0, frames * 2, g_interleaved.data());
-        return env->ExceptionCheck() ? 0 : frames;
+        const float* output = g_interleaved.data();
+        size_t outputFrames = static_cast<size_t>(frames);
+        if (rgConvert48) {
+            const auto before = std::chrono::steady_clock::now();
+            outputFrames = rgSrc.process(g_interleaved.data(), frames, rgConverted.data(), rgConverted.size()/2);
+            for (size_t i=0; i<outputFrames*2; ++i) rgConverted[i] = std::clamp(rgConverted[i], -1.0f, 1.0f);
+            const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now()-before).count());
+            rgSrcNanos.store(ns); rgSrcMaxNanos.store(std::max(rgSrcMaxNanos.load(), ns));
+            rgSrcInputs.store(rgSrc.inputFrames()); rgSrcOutputs.store(rgSrc.outputFrames());
+            output = rgConverted.data();
+        }
+        env->SetFloatArrayRegion(buffer, 0, static_cast<jsize>(outputFrames*2), output);
+        return env->ExceptionCheck() ? 0 : static_cast<jint>(outputFrames);
     } catch (const std::exception& error) { rgThrow(env, error.what()); }
       catch (const std::string& error) { rgThrow(env, error.c_str()); }
       catch (...) { rgThrow(env, "Native render failed"); }
     return 0;
 }
-
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_rinoize_rigear_RuntimeBridge_conversionStats(JNIEnv* env, jclass) {
+    const jlong v[] = {static_cast<jlong>(rgSrcNanos.load()), static_cast<jlong>(rgSrcMaxNanos.load()),
+                      static_cast<jlong>(rgSrcInputs.load()), static_cast<jlong>(rgSrcOutputs.load())};
+    auto a = env->NewLongArray(4); if(a) env->SetLongArrayRegion(a,0,4,v); return a;
+}
 extern "C" JNIEXPORT void JNICALL
 Java_com_rinoize_rigear_RuntimeBridge_panic(JNIEnv*, jclass) {
     std::lock_guard<std::mutex> lock(g_midiMutex); rgPanicLocked(true);
@@ -201,7 +251,7 @@ extern "C" JNIEXPORT jlongArray JNICALL
 Java_com_rinoize_rigear_RuntimeBridge_signalStats(JNIEnv* env, jclass, jboolean reset) {
     const jlong values[] = {static_cast<jlong>(rgClips.load()), static_cast<jlong>(rgBad.load()),
                            static_cast<jlong>(rgPeakBits.load())};
-    if (reset) { rgClips.store(0); rgBad.store(0); }
+    if (reset) { rgClips.store(0); rgBad.store(0); rgSrcMaxNanos.store(0); }
     auto result = env->NewLongArray(3);
     if (result) env->SetLongArrayRegion(result, 0, 3, values);
     return result;
