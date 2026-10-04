@@ -14,7 +14,8 @@ Bytes studioBytes(JNIEnv* env, jbyteArray data, size_t maximum = 267 * 18) {
     if (env->ExceptionCheck()) throw std::runtime_error("Could not read JNI data");
     return result;
 }
-jbyteArray studioArray(JNIEnv* env, const Bytes& data) {
+template<class Allocator>
+jbyteArray studioArray(JNIEnv* env, const std::vector<uint8_t, Allocator>& data) {
     auto result = env->NewByteArray(static_cast<jsize>(data.size()));
     if (result && !data.empty()) env->SetByteArrayRegion(result, 0,
         static_cast<jsize>(data.size()), reinterpret_cast<const jbyte*>(data.data()));
@@ -36,6 +37,8 @@ std::vector<Bytes> studioValidate(const Bytes& data) {
             throw std::invalid_argument("Not a Virus A/B/C sound dump");
         for (size_t i = 1; i < 266; ++i) if (p[i] > 127)
             throw std::invalid_argument("Non MIDI data in sound dump");
+        if (p[6] == 0x10 && p[9] >= 7)
+            throw std::invalid_argument("TI sound data is not compatible with Virus A/B/C");
         const auto checksum = p[265]; studioChecksum(p);
         if (checksum != p[265]) throw std::invalid_argument("Invalid Virus SysEx checksum");
         packets.emplace_back(std::move(p));
@@ -117,18 +120,18 @@ Java_com_rinoize_rigear_StudioBridge_load(JNIEnv* env, jclass, jbyteArray data, 
         std::vector<synthLib::SMidiEvent> commands;
         if (kind == 0) {
             auto p = packets.front(); p[5] = 0x10; p[7] = 0; p[8] = static_cast<uint8_t>(target); studioChecksum(p);
-            synthLib::SMidiEvent e(synthLib::MidiEventSource::Editor); e.sysex = std::move(p); commands.emplace_back(std::move(e));
+            synthLib::SMidiEvent e(synthLib::MidiEventSource::Editor); e.sysex.assign(p.begin(), p.end()); commands.emplace_back(std::move(e));
         } else {
             const auto it = std::find_if(packets.begin(), packets.end(), [](const Bytes& p) { return p[6] == 0x11; });
             Bytes multi = *it; multi[5] = 0x10; multi[7] = 0; multi[8] = 0; studioChecksum(multi);
-            synthLib::SMidiEvent e(synthLib::MidiEventSource::Editor); e.sysex = std::move(multi); commands.emplace_back(std::move(e));
+            synthLib::SMidiEvent e(synthLib::MidiEventSource::Editor); e.sysex.assign(multi.begin(), multi.end()); commands.emplace_back(std::move(e));
             for (int part = 0; part < 16; ++part) {
                 auto single = std::find_if(packets.begin(), packets.end(), [part](const Bytes& p) {
                     return p[6] == 0x10 && p[7] == 0 && p[8] == part;
                 });
                 if (single != packets.end()) {
                     Bytes p = *single; p[5] = 0x10; p[7] = 0; studioChecksum(p);
-                    synthLib::SMidiEvent se(synthLib::MidiEventSource::Editor); se.sysex = std::move(p); commands.emplace_back(std::move(se));
+                    synthLib::SMidiEvent se(synthLib::MidiEventSource::Editor); se.sysex.assign(p.begin(), p.end()); commands.emplace_back(std::move(se));
                 } else {
                     // Standalone Multi dumps only reference bank/program sounds.
                     commands.push_back(studioParam(0x72, part, 31, (*it)[9 + 32 + part]));

@@ -30,7 +30,8 @@ public final class StudioActivity extends Activity {
     private SoundCodec.Snapshot state;
     private volatile boolean destroyed, visible, ready, midiGate;
     private boolean busy, syncing, nativeOk, onlyFavorites, dirty, comparing;
-    private int selectedPart = 64, page, editGroup, generation;
+    private int selectedPart = 64, page, editGroup, generation, workToken, lastSyncedGeneration = -1;
+    private long lastSyncedMidi = -1, nextSyncAt;
     private long changedAt, cpuBefore, wallBefore, startedAt, firstUnderrun = -1, nextTrace;
     private int underrunBase;
     private RealtimeAudio.Session measured;
@@ -59,7 +60,7 @@ public final class StudioActivity extends Activity {
     private final Runnable tick = new Runnable() {
         @Override public void run() {
             if (!visible || destroyed) return;
-            try { meters(); if (ready && !busy && !syncing && SystemClock.elapsedRealtime() - changedAt > 1500) sync(false); }
+            try { meters(); autoSync(); }
             catch (RuntimeException | LinkageError e) { message(e.getMessage()); }
             ui.postDelayed(this, 1000);
         }
@@ -135,9 +136,9 @@ public final class StudioActivity extends Activity {
     private void message(String text){status.setText(text==null?"Operación fallida":text);}
     private void work(String label,Work work){
         if(busy || destroyed || !nativeOk)return;
-        busy=true; message(label); controls();
+        busy=true; final int token=++workToken; message(label); controls();
         ENGINE.execute(()->{try{if(!destroyed)work.run();}catch(Exception|LinkageError e){ui.post(()->{if(!destroyed)message(e.toString());});}
-            finally{ui.post(()->{if(!destroyed){busy=false;controls();}});}});
+            finally{ui.post(()->{if(!destroyed && token==workToken){busy=false;controls();}});}});
     }
     private void storage(String label,Work work){
         if(library==null){message("Biblioteca aún no disponible");return;}
@@ -145,7 +146,7 @@ public final class StudioActivity extends Activity {
     }
     private void changed(){dirty=true; comparing=false; generation++; changedAt=SystemClock.elapsedRealtime(); refreshPatch();}
     private int set(int pg,int index,int n){
-        if(!ready || busy || current()==null)return Math.max(0,value(pg,index));
+        if(!ready || busy || comparing || current()==null)return Math.max(0,value(pg,index));
         try{
             int target=(pg==0x71 && index==16 && selectedPart!=64)?0:selectedPart;
             StudioBridge.parameters(target,new int[]{pg,index,n});
@@ -155,7 +156,7 @@ public final class StudioActivity extends Activity {
         }catch(RuntimeException e){message(e.getMessage());return Math.max(0,value(pg,index));}
     }
     private int linked(int first,int second,int requested){
-        if(!ready || busy || current()==null)return Math.max(0,value(0x70,first));
+        if(!ready || busy || comparing || current()==null)return Math.max(0,value(0x70,first));
         // If the patch already uses firmware Cutoff Link, keep its native offset untouched.
         if(first==40 && value(0x71,32)!=0)return set(0x70,40,requested);
         int[] pair=SoundCodec.linked(value(0x70,first),value(0x70,second),requested);
@@ -199,7 +200,8 @@ public final class StudioActivity extends Activity {
         LinearLayout arpTools=skin.row();
         latch=skin.button("LATCH",StudioUi.GREEN,v->{set(0x71,4,value(0x71,4)==0?1:0);refreshValues();});skin.space(arpTools,latch);
         skin.space(arpTools,skin.button("Comparar",StudioUi.BLUE,v->compare()));
-        skin.space(arpTools,skin.button("★ Solo favoritos",StudioUi.ORANGE,v->{onlyFavorites=!onlyFavorites;message(onlyFavorites?"PATCH ‹/› recorre solo favoritos":"PATCH ‹/› recorre la biblioteca Single");}));
+        Button homeFavorites=skin.button("★ Solo favoritos",StudioUi.ORANGE,v->{onlyFavorites=!onlyFavorites;v.setSelected(onlyFavorites);message(onlyFavorites?"PATCH ‹/› recorre solo favoritos":"PATCH ‹/› recorre la biblioteca Single");});
+        homeFavorites.setSelected(onlyFavorites);skin.space(arpTools,homeFavorites);
         left.addView(arpTools);content.addView(left,new LinearLayout.LayoutParams(0,-2,4));
         StudioUi.Dial length=dial("NOTE LENGTH",0x71,5,0,127,StudioUi.PURPLE,n->String.format(Locale.ROOT,"%+d",n-64));
         StudioUi.Dial tempo=dial("GLOBAL TEMPO",0x71,16,0,127,StudioUi.PURPLE,n->(n+63)+" BPM");
@@ -350,13 +352,13 @@ public final class StudioActivity extends Activity {
         if(comparing){message("Volvé de Comparar antes de guardar");return;}
         String suggested=arrangement?"Live Multi":current()==null?"Mi sonido":SoundCodec.name(current());
         ask("Guardar copia de usuario · máximo 10 ASCII",suggested,name->{
-            final int part=selectedPart;work("Leyendo edit buffer real…",()->{
+            final int part=selectedPart, saveVersion=generation;work("Leyendo edit buffer real…",()->{
                 byte[] raw=StudioBridge.snapshot();if(raw==null)throw new IllegalStateException("Hay cambios MIDI pendientes. Esperá un momento y volvé a guardar.");
                 SoundCodec.Snapshot snapshot=new SoundCodec.Snapshot(raw);byte[] data=arrangement?snapshot.arrangement():snapshot.single(part);
                 if(data==null)throw new IllegalStateException("El motor no devolvió el sonido seleccionado");
                 byte[] renamed=SoundCodec.rename(data,name);
                 STORAGE.execute(()->{try{SoundLibrary.Entry e=library.add(renamed,"Usuario",arrangement?"Mis Multis":"Mis sonidos",true);
-                    ui.post(()->{if(!destroyed){selectedId=e.id;dirty=false;message("Guardado: "+e.name()+". La copia ya está en Biblioteca.");if(page==4)refreshLibrary();}});
+                    ui.post(()->{if(!destroyed){selectedId=e.id;if(generation==saveVersion && selectedPart==part)dirty=false;message("Guardado: "+e.name()+". La copia ya está en Biblioteca.");if(page==4)refreshLibrary();}});
                 }catch(Exception e){ui.post(()->message(e.getMessage()));}});
             });
         });
@@ -376,9 +378,9 @@ public final class StudioActivity extends Activity {
     private void reorder(int step){SoundLibrary.Entry e=selected();if(e==null||setFilter.isEmpty()){message("↑/↓ reordena sonidos dentro de una setlist");return;}String set=setFilter;storage("Reordenando…",()->library.reorder(set,e.id,step));}
     private void compare(){
         if(!ready||current()==null)return;
-        if(comparing&&compareReturn!=null){StudioBridge.load(compareReturn,compareTarget,0);state.singles[slot()]=compareReturn.clone();comparing=false;refreshValues();message("Volviste a la edición");return;}
+        if(comparing&&compareReturn!=null){StudioBridge.load(compareReturn,compareTarget,0);state.singles[slot()]=compareReturn.clone();comparing=false;generation++;changedAt=SystemClock.elapsedRealtime();refreshValues();controls();message("Volviste a la edición");return;}
         SoundLibrary.Entry original=library==null?null:library.get(partIds[slot()]);if(original==null||original.multi()){message("Cargá un Single de la biblioteca para comparar con el original");return;}
-        compareReturn=current().clone();compareTarget=selectedPart;StudioBridge.load(original.data,selectedPart,0);state.singles[slot()]=SoundCodec.primary(original.data).clone();comparing=true;generation++;changedAt=SystemClock.elapsedRealtime();refreshValues();message("COMPARE: original. Pulsá Comparar para volver a tu edición.");
+        compareReturn=current().clone();compareTarget=selectedPart;StudioBridge.load(original.data,selectedPart,0);state.singles[slot()]=SoundCodec.primary(original.data).clone();comparing=true;generation++;changedAt=SystemClock.elapsedRealtime();refreshValues();controls();message("COMPARE: original. Pulsá Comparar para volver a tu edición.");
     }
     private void exportSelected(){SoundLibrary.Entry e=selected();if(e!=null)export(e.name()+".syx",e.data,"application/octet-stream");}
     private void exportBank(){try{List<byte[]> data=new ArrayList<>();for(SoundLibrary.Entry e:shown)data.add(e.data);export("RiGear-bank.syx",SoundCodec.exportBank(data),"application/octet-stream");}catch(Exception e){message(e.getMessage());}}
@@ -406,24 +408,36 @@ public final class StudioActivity extends Activity {
             if(result==null||!result.contains("DSP BOOT: OK"))throw new IllegalStateException(result);
             String name=StudioBridge.firmwareInfo();byte[][] factory=StudioBridge.factory();byte[] current=StudioBridge.snapshot();
             SoundCodec.Snapshot snapshot=current==null?null:new SoundCodec.Snapshot(current);
-            STORAGE.execute(()->{
-                try{if(retain)StudioFiles.retainRom(this,bundle);if(library!=null&&factory!=null)library.indexFactory(factory,name);
-                    ui.post(()->{if(destroyed)return;state=snapshot;firmware=name;ready=true;selectedPart=64;Arrays.fill(partIds,null);
-                        if(library!=null&&snapshot!=null&&snapshot.single(64)!=null){String match=SoundCodec.name(snapshot.single(64));for(SoundLibrary.Entry e:library.all())if(e.factory&&e.source.equals(name)&&e.name().equals(match)){partIds[16]=e.id;break;}}
-                        selectedId=partIds[16];generation++;changedAt=SystemClock.elapsedRealtime();rebuildCurrent();message(name+" listo · START en CONFIG. ROM y favoritos se conservan al cerrar.");});
-                }catch(Exception e){ui.post(()->message("ROM arrancada, pero almacenamiento falló: "+e.getMessage()));}
-            });
+            // Keep the control transaction busy until storage completes. No audio is
+            // running here, and neither the UI nor the render thread waits for disk I/O.
+            String storageWarning=STORAGE.submit(()->{
+                try{if(retain)StudioFiles.retainRom(this,bundle);if(library!=null&&factory!=null)library.indexFactory(factory,name);return "";}
+                catch(Exception e){return " · almacenamiento: "+e.getMessage();}
+            }).get();
+            ui.post(()->{if(destroyed)return;state=snapshot;firmware=name;ready=true;selectedPart=64;Arrays.fill(partIds,null);
+                if(library!=null&&snapshot!=null&&snapshot.single(64)!=null){String match=SoundCodec.name(snapshot.single(64));for(SoundLibrary.Entry e:library.all())if(e.factory&&e.source.equals(name)&&e.name().equals(match)){partIds[16]=e.id;break;}}
+                selectedId=partIds[16];generation++;changedAt=SystemClock.elapsedRealtime();rebuildCurrent();
+                message(name+" listo · START en CONFIG"+(storageWarning.isEmpty()?". ROM y favoritos se conservan al cerrar.":storageWarning));});
         });
     }
     private void setMode(boolean useMulti){
         if(!ready||busy)return;
         guard(()->{try{StudioBridge.mode(useMulti);selectedPart=useMulti?partSelector.getSelectedItemPosition():64;dirty=false;generation++;changedAt=SystemClock.elapsedRealtime();rebuildCurrent();message(useMulti?"MULTI: cada parte responde a su canal MIDI. La selección de parte no cambia el canal del teclado.":"SINGLE: canal MIDI 1");}catch(RuntimeException e){message(e.getMessage());}});
     }
+    private void autoSync(){
+        long now=SystemClock.elapsedRealtime();
+        if(!ready||busy||syncing||comparing||now<nextSyncAt||now-changedAt<1500)return;
+        long messages=midi==null?0:midi.telemetry.snapshot()[0];
+        // A held chord with no new input does not require repeated full-state snapshots.
+        if(generation==lastSyncedGeneration && messages==lastSyncedMidi)return;
+        nextSyncAt=now+2000;sync(false);
+    }
     private void sync(boolean explicit){
-        if(!ready||syncing||busy||destroyed||!audio.isRunning())return;syncing=true;final int version=generation;
+        if(!ready||syncing||busy||destroyed||comparing||!audio.isRunning())return;
+        syncing=true;final int version=generation;final long messages=midi==null?0:midi.telemetry.snapshot()[0];
         ENGINE.execute(()->{
             try{byte[] data=StudioBridge.snapshot();SoundCodec.Snapshot next=data==null?null:new SoundCodec.Snapshot(data);
-                ui.post(()->{if(!destroyed&&next!=null&&generation==version){state=next;refreshPatch();refreshValues();if(page==2)fillMulti();if(explicit)message("Panel sincronizado con el edit buffer del Virus");}});
+                ui.post(()->{if(!destroyed&&next!=null&&generation==version){state=next;lastSyncedGeneration=version;lastSyncedMidi=messages;refreshPatch();refreshValues();if(page==2)fillMulti();if(explicit)message("Panel sincronizado con el edit buffer del Virus");}});
             }catch(Exception e){if(explicit)ui.post(()->message(e.getMessage()));}
             finally{ui.post(()->syncing=false);}
         });
@@ -469,7 +483,7 @@ public final class StudioActivity extends Activity {
         final int f=settingValue("block",BLOCKS,0),r=settingValue("rate",RATES,1),o=settingValue("output",OUTPUTS,3),x=settingValue("extra",EXTRAS,2),c=settingValue("clock",CLOCKS,2),g=settingValue("gain",GAINS,1),m=preferences.getInt("mode",1);
         midiGate=false;if(midi!=null)midi.telemetry.reset(false);
         work("Iniciando audio…",()->{if(!visible||!ready)return;audio.start(f,c,x,g,m,o,r);if(!visible||destroyed){audio.stop();return;}midiGate=true;
-            ui.post(()->{if(!destroyed){startedAt=SystemClock.elapsedRealtime();firstUnderrun=-1;trace.clear();nextTrace=0;message("Audio activo · "+firmware);}});});
+            ui.post(()->{if(!destroyed){startedAt=SystemClock.elapsedRealtime();firstUnderrun=-1;lastSyncedGeneration=-1;trace.clear();nextTrace=0;message("Audio activo · "+firmware);}});});
     }
     private void stopAudio(){midiGate=false;work("Deteniendo…",()->{audio.stop();ui.post(()->{if(!destroyed)message("Audio detenido. La edición sigue en memoria; guardá una copia para conservarla al cerrar.");});});}
     private void panic(){if(nativeOk)RuntimeBridge.panic();if(midi!=null)midi.telemetry.reset(false);message("PANIC · notas y sustain liberados");}
@@ -478,7 +492,7 @@ public final class StudioActivity extends Activity {
         boolean active=audio.hasLiveSession();single.setEnabled(ready&&!busy);multi.setEnabled(ready&&!busy);favorite.setEnabled(ready&&library!=null);
         if(start!=null)start.setEnabled(ready&&!busy&&!active);if(stop!=null)stop.setEnabled(active&&!busy);
         if(page==5)for(Spinner s:new Spinner[]{buffer,rate,outputMode,outputSize,extra,clock,gain})if(s!=null)s.setEnabled(!active&&!busy);
-        for(DialBinding b:dials)b.dial.setEnabled(ready&&!busy&&current()!=null);for(Button b:arpButtons)b.setEnabled(ready&&!busy);if(latch!=null)latch.setEnabled(ready&&!busy);
+        for(DialBinding b:dials)b.dial.setEnabled(ready&&!busy&&!comparing&&current()!=null);for(Button b:arpButtons)b.setEnabled(ready&&!busy&&!comparing);if(latch!=null)latch.setEnabled(ready&&!busy&&!comparing);
     }
     private void meters(){
         long wall=SystemClock.elapsedRealtime(),cpu=android.os.Process.getElapsedCpuTime();double use=wallBefore>0&&wall>wallBefore?100.0*(cpu-cpuBefore)/(wall-wallBefore):0;wallBefore=wall;cpuBefore=cpu;
