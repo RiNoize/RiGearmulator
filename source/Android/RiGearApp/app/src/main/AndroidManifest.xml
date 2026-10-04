@@ -1,24 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-feature
-        android:name="android.software.midi"
-        android:required="false" />
-    <uses-feature
-        android:name="android.hardware.usb.host"
-        android:required="false" />
-
-    <application
-        android:allowBackup="false"
-        android:label="RiGear"
-        android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.NoActionBar">
-        <activity
-            android:name=".MainActivity"
-            android:exported="true"
-            android:screenOrientation="landscape">
+    <uses-feature android:name="android.software.midi" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <application android:allowBackup="false" android:label="RiGear" android:supportsRtl="true"
+        android:theme="@style/RiGearTheme">
+        <activity android:name=".StudioActivity" android:exported="true" android:screenOrientation="landscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name=".MainActivity" android:exported="false" android:screenOrientation="landscape" />
     </application>
 </manifest>
