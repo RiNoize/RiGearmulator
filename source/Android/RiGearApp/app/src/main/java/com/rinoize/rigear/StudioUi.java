@@ -29,7 +29,20 @@ public final class StudioUi {
         d.setCornerRadius(dp(7)); d.setStroke(dp(1), color); return d;
     }
     public Button button(String label, int accent, View.OnClickListener listener) {
-        Button b = new Button(context); b.setText(label); b.setTextSize(11); b.setTextColor(TEXT); b.setAllCaps(false);
+        Button b = new Button(context) {
+            @Override protected void onAttachedToWindow() {
+                super.onAttachedToWindow();
+                ViewParent parent = getParent();
+                if (parent instanceof ViewGroup && parent.getParent() instanceof AbsListView) {
+                    // A focusable star would suppress ListView's row click. Keep the
+                    // row selectable while the star retains its own touch action.
+                    ((ViewGroup) parent).setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
+                    setFocusable(false);
+                    setFocusableInTouchMode(false);
+                }
+            }
+        };
+        b.setText(label); b.setTextSize(11); b.setTextColor(TEXT); b.setAllCaps(false);
         b.setMinWidth(0); b.setMinimumWidth(0); b.setMinHeight(dp(38)); b.setMinimumHeight(dp(38));
         b.setPadding(dp(9), dp(4), dp(9), dp(4));
         StateListDrawable drawable = new StateListDrawable();
