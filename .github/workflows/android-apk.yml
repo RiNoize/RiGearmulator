@@ -15,7 +15,7 @@ env:
   NATIVE_BUILD: build/android-release
 jobs:
   build-apk:
-    name: RiGear 0.10 Studio ARM64
+    name: RiGear 0.11 Patch Browser ARM64
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -31,7 +31,7 @@ jobs:
         run: |
           mkdir -p artifacts build/tests
           python3 source/Android/RiGearApp/tools/generate_studio_parameters.py | tee artifacts/catalog-report.txt
-          git archive --format=zip HEAD source/Android/RiGearApp source/Android/rigearNative .github/workflows/android-apk.yml > artifacts/RiGear-0.10-source.zip
+          git archive --format=zip HEAD source/Android/RiGearApp source/Android/rigearNative .github/workflows/android-apk.yml > artifacts/RiGear-0.11-source.zip
       - name: Test sound library, favorites, persistence and macro bounds
         run: |
           JAVA_SRC=source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear
@@ -84,7 +84,7 @@ jobs:
               assert '-DNDEBUG' in command and '-O0' not in command
               assert any(flag in command for flag in ('-O2','-O3','-Ofast'))
               checked.append({'source':suffix,'command':command})
-          pathlib.Path('artifacts/native-build.json').write_text(json.dumps({'version':'0.10.0','commit':os.environ['GITHUB_SHA'],'build':'Release','commands':checked},indent=2))
+          pathlib.Path('artifacts/native-build.json').write_text(json.dumps({'version':'0.11.0','commit':os.environ['GITHUB_SHA'],'build':'Release','commands':checked},indent=2))
           print('Virus/DSP/Studio are optimized Release; existing 0.9 audio and SRC sources preserved')
           PY
       - name: Build shared library
@@ -115,32 +115,37 @@ jobs:
         run: gradle --no-daemon --stacktrace :app:assembleRelease
       - name: Verify packaged app
         run: |
-          cp source/Android/RiGearApp/app/build/outputs/apk/release/app-release.apk artifacts/RiGear-0.10-arm64.apk
-          "${ANDROID_HOME}/build-tools/35.0.0/aapt" dump badging artifacts/RiGear-0.10-arm64.apk > artifacts/apk-info.txt
+          cp source/Android/RiGearApp/app/build/outputs/apk/release/app-release.apk artifacts/RiGear-0.11-arm64.apk
+          "${ANDROID_HOME}/build-tools/35.0.0/aapt" dump badging artifacts/RiGear-0.11-arm64.apk > artifacts/apk-info.txt
           python3 - <<'PY'
           import zipfile, pathlib, json
-          with zipfile.ZipFile('artifacts/RiGear-0.10-arm64.apk') as apk:
+          with zipfile.ZipFile('artifacts/RiGear-0.11-arm64.apk') as apk:
               assert 'lib/arm64-v8a/librigear.so' in apk.namelist()
               assert len(json.loads(apk.read('assets/studio-parameters.json'))) > 100
           info=pathlib.Path('artifacts/apk-info.txt').read_text()
-          assert "versionCode='11'" in info and "versionName='0.10.0'" in info
+          assert "versionCode='12'" in info and "versionName='0.11.0'" in info
           assert 'com.rinoize.rigear.StudioActivity' in info
           print('Studio launcher, real parameter catalog, ARM64 engine and APK version verified')
+          ui = pathlib.Path('source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear/StudioActivity.java').read_text()
+          native = pathlib.Path('source/Android/rigearNative/RiGearStudio.cpp').read_text()
+          assert 'StudioBridge.selectFactory' in ui and 'StudioBridge_selectFactory' in native
+          assert 'BANK -' in ui and 'PATCH +' in ui and 'Bank '+chr(65) in ui
+          print('Direct Factory Bank Select + Program Change browser wiring verified')
           PY
-          cp source/Android/RiGearApp/TESTING-0.10.md artifacts/
-          echo '### RiGear 0.10 Studio' >> "$GITHUB_STEP_SUMMARY"
+          cp source/Android/RiGearApp/TESTING-0.11.md artifacts/
+          echo '### RiGear 0.11 Patch Browser' >> "$GITHUB_STEP_SUMMARY"
           echo 'Release verified; library/persistence/SysEx/SRC/MIDI tests and Java API compilation passed.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Sound, Multi routing, tablet layout and long-session thermal behavior still require device testing.' >> "$GITHUB_STEP_SUMMARY"
       - name: Upload Studio APK
         uses: actions/upload-artifact@v4
         with:
-          name: RiGear-0.10-Studio-arm64
+          name: RiGear-0.11-PatchBrowser-arm64
           path: artifacts/
           if-no-files-found: error
       - name: Upload sources and diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: RiGear-0.10-build-diagnostics
+          name: RiGear-0.11-build-diagnostics
           path: artifacts/
           if-no-files-found: warn

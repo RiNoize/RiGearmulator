@@ -104,6 +104,35 @@ Java_com_rinoize_rigear_StudioBridge_factory(JNIEnv* env, jclass) {
     return nullptr;
 }
 
+// Select Factory exactly like a hardware/MIDI patch change.
+// Single mode: CC32 Bank Select LSB + Program Change. Multi: the same bank/program
+// is addressed directly to the selected part through the Virus multi parameter page.
+extern "C" JNIEXPORT void JNICALL
+Java_com_rinoize_rigear_StudioBridge_selectFactory(JNIEnv* env, jclass, jint bank, jint program, jint part) {
+    try {
+        if (bank < 1 || bank > 8 || program < 0 || program > 127)
+            throw std::invalid_argument("Invalid Factory bank/program");
+        if ((part < 0 || part > 15) && part != 64)
+            throw std::invalid_argument("Invalid target part");
+        std::lock_guard<std::mutex> lock(g_midiMutex);
+        if (g_pendingMidi.size() > 3072) throw std::runtime_error("MIDI queue busy");
+        if (part == 64) {
+            // This is the same path that already works from an external controller.
+            g_pendingMidi.emplace_back(synthLib::MidiEventSource::Editor, 0xb0, 32,
+                                       static_cast<uint8_t>(bank), 0);
+            g_pendingMidi.emplace_back(synthLib::MidiEventSource::Editor, 0xc0,
+                                       static_cast<uint8_t>(program), 0, 0);
+        } else {
+            // In Multi, address the selected part directly; no dependence on its current MIDI channel.
+            g_pendingMidi.push_back(studioParam(0x72, static_cast<uint8_t>(part), 31,
+                                                static_cast<uint8_t>(bank)));
+            g_pendingMidi.push_back(studioParam(0x72, static_cast<uint8_t>(part), 33,
+                                                static_cast<uint8_t>(program)));
+        }
+    } catch (const std::exception& e) { rgThrow(env, e.what()); }
+      catch (...) { rgThrow(env, "Factory patch selection failed"); }
+}
+
 // kind=0: a single to target 0..15 or 64. kind=1: multi configuration/arrangement.
 // All imported bank destinations are rewritten to edit buffers: NEVER overwrite factory/RAM banks.
 extern "C" JNIEXPORT void JNICALL

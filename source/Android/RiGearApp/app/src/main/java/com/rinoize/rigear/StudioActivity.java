@@ -38,7 +38,7 @@ public final class StudioActivity extends Activity {
     private final ArrayList<String> trace = new ArrayList<>();
     private final String[] partIds = new String[17];
     private byte[] compareReturn, exportBytes;
-    private int compareTarget = 64;
+    private int compareTarget = 64, bankFilter = -1;
     private String firmware = "Sin ROM", selectedId, sourceFilter = "Todos", setFilter = "", query = "", category = "Todas";
     private TextView topStats, patchName, status, footer, thermalText, audioDetails, libraryDetails, libraryCount;
     private Button start, stop, favorite, single, multi, favoriteFilter;
@@ -87,7 +87,7 @@ public final class StudioActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
         LinearLayout root = skin.column(); root.setBackgroundColor(StudioUi.BG); root.setPadding(skin.dp(6),skin.dp(4),skin.dp(6),skin.dp(4));
         LinearLayout header = skin.row();
-        TextView brand = skin.text("RiGear 0.10", 21, StudioUi.TEXT); brand.setTypeface(Typeface.DEFAULT, Typeface.BOLD); skin.space(header, brand);
+        TextView brand = skin.text("RiGear 0.11", 21, StudioUi.TEXT); brand.setTypeface(Typeface.DEFAULT, Typeface.BOLD); skin.space(header, brand);
         for (int i=0; i<PAGES.length; ++i) {
             final int p=i; Button b=skin.button(PAGES[i], StudioUi.BLUE, v->showPage(p)); tabs.add(b);
             LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,skin.dp(40),1); lp.setMargins(skin.dp(2),0,skin.dp(2),0); header.addView(b,lp);
@@ -102,10 +102,12 @@ public final class StudioActivity extends Activity {
             public void onItemSelected(AdapterView<?> a,View v,int p,long id){ if(selectedPart!=64 && selectedPart!=p){selectedPart=p; refreshPatch(); rebuildCurrent();} }
             public void onNothingSelected(AdapterView<?> a){}
         });
-        Button previous=skin.button("‹",StudioUi.BLUE,v->stepPatch(-1)); skin.space(patchBar,previous);
+        skin.space(patchBar,skin.button("BANK -",StudioUi.BLUE,v->stepBank(-1)));
+        skin.space(patchBar,skin.button("PATCH -",StudioUi.BLUE,v->stepPatch(-1)));
         patchName=skin.text("Cargar ROM en CONFIG",20,StudioUi.BLUE); patchName.setTypeface(Typeface.DEFAULT,Typeface.BOLD); patchName.setMaxLines(2);
         patchName.setOnClickListener(v->showPage(4)); patchBar.addView(patchName,new LinearLayout.LayoutParams(0,-2,1));
-        skin.space(patchBar,skin.button("›",StudioUi.BLUE,v->stepPatch(1)));
+        skin.space(patchBar,skin.button("PATCH +",StudioUi.BLUE,v->stepPatch(1)));
+        skin.space(patchBar,skin.button("BANK +",StudioUi.BLUE,v->stepBank(1)));
         favorite=skin.button("☆",StudioUi.ORANGE,v->toggleCurrentFavorite()); skin.space(patchBar,favorite);
         skin.space(patchBar,skin.button("Guardar",StudioUi.BLUE,v->saveCurrent()));
         skin.space(patchBar,skin.button("PANIC",StudioUi.RED,v->panic())); root.addView(patchBar);
@@ -261,8 +263,10 @@ public final class StudioActivity extends Activity {
     private View libraryPage(){
         LinearLayout root=skin.row(),nav=skin.card("BIBLIOTECA",StudioUi.BLUE),middle=skin.column(),detail=skin.card("SONIDO",StudioUi.BLUE);
         String[] filters={"Todos","Factory","Usuario","Importados","★ Favoritos","Recientes","Singles","Multis"};
-        for(String filter:filters){Button b=skin.button(filter,StudioUi.BLUE,v->{sourceFilter=filter;setFilter="";refreshLibrary();});nav.addView(b,new LinearLayout.LayoutParams(-1,skin.dp(39)));}
-        nav.addView(skin.button("Setlists…",StudioUi.BLUE,v->chooseSet()));
+        for(String filter:filters){Button b=skin.button(filter,StudioUi.BLUE,v->{sourceFilter=filter;bankFilter=-1;setFilter="";refreshLibrary();});nav.addView(b,new LinearLayout.LayoutParams(-1,skin.dp(36)));}
+        nav.addView(skin.button("Setlists…",StudioUi.BLUE,v->chooseSet()),new LinearLayout.LayoutParams(-1,skin.dp(36)));
+        TextView bankTitle=skin.text("BANCOS FACTORY",11,StudioUi.MUTED);bankTitle.setPadding(0,skin.dp(7),0,skin.dp(2));nav.addView(bankTitle);
+        for(int b=0;b<8;++b){final int bank=b;Button bankButton=skin.button("Bank "+(char)('A'+b),StudioUi.BLUE,v->{sourceFilter="Factory";bankFilter=bank;setFilter="";refreshLibrary();});nav.addView(bankButton,new LinearLayout.LayoutParams(-1,skin.dp(35)));}
         EditText search=new EditText(this);search.setSingleLine();search.setTextColor(StudioUi.TEXT);search.setHintTextColor(StudioUi.MUTED);search.setHint("Buscar nombre, categoría o banco…");search.setText(query);
         search.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence s,int st,int c,int a){}public void onTextChanged(CharSequence s,int st,int b,int c){query=s.toString();refreshLibrary();}public void afterTextChanged(Editable e){}});
         middle.addView(search,new LinearLayout.LayoutParams(-1,skin.dp(44)));
@@ -271,10 +275,10 @@ public final class StudioActivity extends Activity {
         Spinner cat=spinner(cats,Math.max(0,Arrays.asList(cats).indexOf(category)),p->{category=cats[p];refreshLibrary();});filtersRow.addView(cat,new LinearLayout.LayoutParams(0,skin.dp(40),1));middle.addView(filtersRow);
         libraryCount=skin.text("",11,StudioUi.MUTED);middle.addView(libraryCount);
         soundList=new ListView(this);soundList.setDividerHeight(skin.dp(1));soundAdapter=new SoundAdapter();soundList.setAdapter(soundAdapter);
-        soundList.setOnItemClickListener((parent,view,p,id)->{selectedId=shown.get(p).id;refreshLibraryDetails();soundAdapter.notifyDataSetChanged();});middle.addView(soundList,new LinearLayout.LayoutParams(-1,0,1));
+        soundList.setOnItemClickListener((parent,view,p,id)->{SoundLibrary.Entry e=shown.get(p);selectedId=e.id;refreshLibraryDetails();soundAdapter.notifyDataSetChanged();guard(()->loadEntry(e));});middle.addView(soundList,new LinearLayout.LayoutParams(-1,0,1));
         LinearLayout manage=skin.row();skin.space(manage,skin.button("Importar",StudioUi.BLUE,v->pickSounds()));skin.space(manage,skin.button("Exportar banco",StudioUi.BLUE,v->exportBank()));skin.space(manage,skin.button("Backup",StudioUi.BLUE,v->backupLibrary()));middle.addView(manage);
         libraryDetails=skin.text("Seleccioná un sonido",13,StudioUi.TEXT);libraryDetails.setMaxLines(12);detail.addView(libraryDetails,new LinearLayout.LayoutParams(-1,0,1));
-        detail.addView(skin.button("CARGAR",StudioUi.BLUE,v->loadSelected()));
+        detail.addView(skin.button("CARGAR / TOCAR",StudioUi.BLUE,v->loadSelected()));
         LinearLayout favRow=skin.row();skin.equal(favRow,skin.button("★ Favorito",StudioUi.ORANGE,v->toggleSelectedFavorite()));skin.equal(favRow,skin.button("Exportar",StudioUi.BLUE,v->exportSelected()));detail.addView(favRow,new LinearLayout.LayoutParams(-1,skin.dp(43)));
         LinearLayout edits=skin.row();skin.equal(edits,skin.button("Copiar",StudioUi.BLUE,v->copySelected()));skin.equal(edits,skin.button("Renombrar",StudioUi.BLUE,v->renameSelected()));detail.addView(edits,new LinearLayout.LayoutParams(-1,skin.dp(43)));
         LinearLayout org=skin.row();skin.equal(org,skin.button("Mover",StudioUi.BLUE,v->moveSelected()));skin.equal(org,skin.button("Setlist +",StudioUi.BLUE,v->addSelectedToSet()));detail.addView(org,new LinearLayout.LayoutParams(-1,skin.dp(43)));
@@ -284,7 +288,7 @@ public final class StudioActivity extends Activity {
         root.addView(detail,new LinearLayout.LayoutParams(skin.dp(205),-1));refreshLibrary();return root;
     }
     private void refreshLibrary(){
-        if(page!=4||soundAdapter==null)return;shown=filtered();favoriteFilter.setSelected(onlyFavorites);libraryCount.setText((setFilter.isEmpty()?sourceFilter:"Setlist: "+setFilter)+" · "+shown.size()+" sonidos");
+        if(page!=4||soundAdapter==null)return;shown=filtered();favoriteFilter.setSelected(onlyFavorites);String where=!setFilter.isEmpty()?"Setlist: "+setFilter:(bankFilter>=0?"Bank "+(char)('A'+bankFilter):sourceFilter);libraryCount.setText(where+" · "+shown.size()+" sonidos · tocar una fila = cargar");
         soundAdapter.notifyDataSetChanged();refreshLibraryDetails();
     }
     private List<SoundLibrary.Entry> filtered(){
@@ -292,6 +296,7 @@ public final class StudioActivity extends Activity {
         for(SoundLibrary.Entry e:setFilter.isEmpty()?library.all():library.set(setFilter)){
             if((onlyFavorites||sourceFilter.equals("★ Favoritos"))&&!e.favorite)continue;
             if(sourceFilter.equals("Factory")&&!e.factory)continue;
+            if(bankFilter>=0){byte[] primary=SoundCodec.primary(e.data);if(!e.factory||primary[6]!=0x10||(primary[7]&127)!=(bankFilter+1))continue;}
             if(sourceFilter.equals("Usuario")&&(e.factory||!e.source.equals("Usuario")))continue;
             if(sourceFilter.equals("Importados")&&(e.factory||e.source.equals("Usuario")))continue;
             if(sourceFilter.equals("Recientes")&&e.used==0)continue;
@@ -312,7 +317,7 @@ public final class StudioActivity extends Activity {
     private SoundLibrary.Entry selected(){return library==null?null:library.get(selectedId);}
     private void refreshLibraryDetails(){
         if(page!=4||libraryDetails==null)return;SoundLibrary.Entry e=selected();
-        if(e==null){libraryDetails.setText("Seleccioná un sonido.\n\nImportar no cambia el patch que está sonando.\nFactory es de solo lectura.");return;}
+        if(e==null){libraryDetails.setText("Elegí Bank A–H y tocá cualquier patch para cargarlo inmediatamente.\n\nPATCH +/- recorre el banco actual; BANK +/- conserva el número de patch cuando es posible.\n\nImportar no cambia el patch que está sonando. Factory es de solo lectura.");return;}
         byte[] p=SoundCodec.primary(e.data);String extra=e.multi()?"Multi de "+SoundCodec.split(e.data).size()+" paquetes\nUn Multi aislado referencia sus bancos originales.":
             "Unison: "+((p[9+97]&127)==0?"OFF":Integer.toString(p[9+97]&127))+"\nArp: "+ARP[Math.min(6,p[9+129]&127)];
         libraryDetails.setText((e.favorite?"★ ":"")+e.name()+"\n"+e.slot()+" · "+(e.multi()?"Multi":"Single")+"\n"+e.category()+"\n\nOrigen: "+e.source+"\nColección: "+e.collection+"\n\n"+extra+"\n\n"+(e.factory?"Factory: copiar antes de editar el archivo.":"Copia persistente de usuario."));
@@ -321,16 +326,39 @@ public final class StudioActivity extends Activity {
     private void loadEntry(SoundLibrary.Entry entry){
         if(!ready){message("Primero cargá una ROM en CONFIG");return;}
         int target=selectedPart;work("Cargando "+entry.name()+"…",()->{
-            StudioBridge.load(entry.data,target,entry.multi()?1:0);
+            byte[] primary=SoundCodec.primary(entry.data);
+            if(entry.factory&&!entry.multi()) StudioBridge.selectFactory(primary[7]&127,primary[8]&127,target);
+            else StudioBridge.load(entry.data,target,entry.multi()?1:0);
             ui.post(()->{if(destroyed)return;if(entry.multi()){selectedPart=0;state=new SoundCodec.Snapshot(entry.data);Arrays.fill(partIds,null);}else{
                 byte[] p=SoundCodec.primary(entry.data).clone();p[7]=0;p[8]=(byte)target;SoundCodec.repair(p);if(state!=null)state.singles[target==64?16:target]=p;partIds[target==64?16:target]=entry.id;}
                 selectedId=entry.id;dirty=false;comparing=false;generation++;changedAt=SystemClock.elapsedRealtime();refreshPatch();rebuildCurrent();message("Cargado: "+entry.name()+(audio.isRunning()?"":" · pulsá START"));});
             STORAGE.execute(()->{try{library.used(entry.id);}catch(IOException ignored){}});
         });
     }
+    private SoundLibrary.Entry factoryEntry(int bank,int program){
+        if(library==null)return null;
+        for(SoundLibrary.Entry e:library.all()){
+            if(!e.factory||e.multi())continue;byte[] p=SoundCodec.primary(e.data);
+            if((p[7]&127)==bank&&(p[8]&127)==program)return e;
+        }
+        return null;
+    }
+    private void stepBank(int step){
+        if(library==null||!ready)return;SoundLibrary.Entry current=library.get(partIds[slot()]);
+        int bank=1,program=0;
+        if(current!=null&&current.factory&&!current.multi()){byte[] p=SoundCodec.primary(current.data);bank=p[7]&127;program=p[8]&127;}
+        bank=((bank-1+step+8)%8)+1;SoundLibrary.Entry next=factoryEntry(bank,program);
+        if(next==null)next=factoryEntry(bank,0);
+        if(next==null){message("Bank "+(char)('A'+bank-1)+" no está disponible en esta ROM");return;}
+        bankFilter=bank-1;sourceFilter="Factory";setFilter="";guard(()->loadEntry(next));
+    }
     private void stepPatch(int step){
-        if(library==null)return;List<SoundLibrary.Entry> all=new ArrayList<>();
-        List<SoundLibrary.Entry> base=setFilter.isEmpty()?library.all():library.set(setFilter);
+        if(library==null)return;SoundLibrary.Entry current=library.get(partIds[slot()]);
+        if(current!=null&&current.factory&&!current.multi()&&!onlyFavorites&&setFilter.isEmpty()){
+            byte[] p=SoundCodec.primary(current.data);int bank=p[7]&127,program=p[8]&127;
+            for(int n=1;n<=128;++n){int candidate=(program+step*n+128*4)%128;SoundLibrary.Entry next=factoryEntry(bank,candidate);if(next!=null){bankFilter=bank-1;sourceFilter="Factory";guard(()->loadEntry(next));return;}}
+        }
+        List<SoundLibrary.Entry> all=new ArrayList<>();List<SoundLibrary.Entry> base=setFilter.isEmpty()?library.all():library.set(setFilter);
         for(SoundLibrary.Entry e:base)if(!e.multi()&&(!onlyFavorites||e.favorite))all.add(e);
         if(all.isEmpty()){message(onlyFavorites?"Todavía no marcaste favoritos":"No hay sonidos Single en la biblioteca");return;}
         String currentId=partIds[slot()];int idx=-1;for(int i=0;i<all.size();++i)if(all.get(i).id.equals(currentId))idx=i;
@@ -374,7 +402,7 @@ public final class StudioActivity extends Activity {
     }
     private void addSelectedToSet(){SoundLibrary.Entry e=selected();if(e==null)return;ask("Nombre de la setlist",setFilter.isEmpty()?"Mi directo":setFilter,name->storage("Guardando setlist…",()->library.addToSet(name,e.id)));}
     private void chooseSet(){if(library==null)return;List<String> names=library.setNames();if(names.isEmpty()){message("Seleccioná un sonido y usá Setlist + para crear una lista");return;}
-        new AlertDialog.Builder(this).setTitle("Setlists").setItems(names.toArray(new String[0]),(d,w)->{setFilter=names.get(w);sourceFilter="Todos";query="";category="Todas";onlyFavorites=false;rebuildCurrent();}).show();}
+        new AlertDialog.Builder(this).setTitle("Setlists").setItems(names.toArray(new String[0]),(d,w)->{setFilter=names.get(w);sourceFilter="Todos";bankFilter=-1;query="";category="Todas";onlyFavorites=false;rebuildCurrent();}).show();}
     private void reorder(int step){SoundLibrary.Entry e=selected();if(e==null||setFilter.isEmpty()){message("↑/↓ reordena sonidos dentro de una setlist");return;}String set=setFilter;storage("Reordenando…",()->library.reorder(set,e.id,step));}
     private void compare(){
         if(!ready||current()==null)return;
