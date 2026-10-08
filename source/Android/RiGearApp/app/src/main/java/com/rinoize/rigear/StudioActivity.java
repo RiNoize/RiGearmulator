@@ -347,10 +347,10 @@ public final class StudioActivity extends Activity {
         if(library==null||!ready)return;SoundLibrary.Entry current=library.get(partIds[slot()]);
         int bank=1,program=0;
         if(current!=null&&current.factory&&!current.multi()){byte[] p=SoundCodec.primary(current.data);bank=p[7]&127;program=p[8]&127;}
-        bank=((bank-1+step+8)%8)+1;SoundLibrary.Entry next=factoryEntry(bank,program);
-        if(next==null)next=factoryEntry(bank,0);
-        if(next==null){message("Bank "+(char)('A'+bank-1)+" no está disponible en esta ROM");return;}
-        bankFilter=bank-1;sourceFilter="Factory";setFilter="";guard(()->loadEntry(next));
+        bank=((bank-1+step+8)%8)+1;SoundLibrary.Entry found=factoryEntry(bank,program);
+        if(found==null)found=factoryEntry(bank,0);
+        if(found==null){message("Bank "+(char)('A'+bank-1)+" no está disponible en esta ROM");return;}
+        final SoundLibrary.Entry next=found;bankFilter=bank-1;sourceFilter="Factory";setFilter="";guard(()->loadEntry(next));
     }
     private void stepPatch(int step){
         if(library==null)return;SoundLibrary.Entry current=library.get(partIds[slot()]);
