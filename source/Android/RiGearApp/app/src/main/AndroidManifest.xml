@@ -3,12 +3,12 @@
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <application android:allowBackup="false" android:label="RiGear" android:supportsRtl="true"
         android:theme="@style/RiGearTheme">
-        <activity android:name=".StudioActivity" android:exported="true" android:screenOrientation="landscape">
+        <activity android:name=".StudioActivity" android:exported="true" android:screenOrientation="sensorLandscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <activity android:name=".MainActivity" android:exported="false" android:screenOrientation="landscape" />
+        <activity android:name=".MainActivity" android:exported="false" android:screenOrientation="sensorLandscape" />
     </application>
 </manifest>
