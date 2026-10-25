@@ -4,21 +4,36 @@ android {
     namespace 'com.rinoize.rigear'
     compileSdk 35
     ndkVersion '27.2.12479018'
+
+    signingConfigs {
+        rigearDevelopment {
+            // Development-only key committed as base64 and restored by CI.
+            // Keeping this identity fixed lets every later APK update the prior one.
+            storeFile rootProject.file('signing/rigear-development.keystore')
+            storePassword 'rigear-dev-2026'
+            keyAlias 'rigear-dev'
+            keyPassword 'rigear-dev-2026'
+        }
+    }
+
     defaultConfig {
         applicationId 'com.rinoize.rigear'
         minSdk 26
         targetSdk 35
-        versionCode 13
-        versionName '0.11.1'
+        versionCode 14
+        versionName '0.11.2'
         ndk { abiFilters 'arm64-v8a' }
     }
     sourceSets { main { jniLibs.srcDirs = ['src/main/jniLibs'] } }
     buildTypes {
-        debug { debuggable true }
+        debug {
+            debuggable true
+            signingConfig signingConfigs.rigearDevelopment
+        }
         release {
             debuggable false
             minifyEnabled false
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.rigearDevelopment
         }
     }
     compileOptions {
