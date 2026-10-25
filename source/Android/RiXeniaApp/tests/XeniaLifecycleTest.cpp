@@ -42,10 +42,15 @@ public:
 
 class Task {
 public:
-    template<class F> explicit Task(F work) : done(result.get_future()), worker([this, work] {
-        try { work(); result.set_value(); }
-        catch (...) { result.set_exception(std::current_exception()); }
-    }) {}
+    template<class F> explicit Task(F work) {
+        // All members are constructed before obtaining the future or launching
+        // a worker that may immediately fulfill the promise.
+        done = result.get_future();
+        worker = std::thread([this, work] {
+            try { work(); result.set_value(); }
+            catch (...) { result.set_exception(std::current_exception()); }
+        });
+    }
     ~Task() { if (worker.joinable()) worker.join(); }
     bool await(TestHardware& hardware, const char* label) {
         const bool timely = done.wait_for(1500ms) == std::future_status::ready;
