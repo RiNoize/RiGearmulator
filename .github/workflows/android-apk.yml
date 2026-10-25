@@ -13,7 +13,6 @@ concurrency:
 env:
   NDK_VERSION: '27.2.12479018'
   NATIVE_BUILD: build/android-release
-  RIGEAR_KEYSTORE_PATH: ${{ runner.temp }}/rigear-signing.keystore
   RIGEAR_CERT_SHA256: 'a945b140b5debca52bb00fd78d83332aebdb7f92b0865408a68c13ef500dbbca'
 jobs:
   build-apk:
@@ -40,24 +39,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.android" artifacts
-          CACHE_KEY="$HOME/.android/rigear-development.keystore"
+          KEY="$HOME/.android/rigear-development.keystore"
           if [ -n "$RIGEAR_SIGNING_KEY_BASE64" ]; then
-            printf '%s' "$RIGEAR_SIGNING_KEY_BASE64" | base64 --decode > "$RIGEAR_KEYSTORE_PATH"
+            printf '%s' "$RIGEAR_SIGNING_KEY_BASE64" | base64 --decode > "$KEY"
             echo 'Signing source: permanent repository secret' | tee artifacts/signing-source.txt
-          elif [ -f "$CACHE_KEY" ]; then
-            cp "$CACHE_KEY" "$RIGEAR_KEYSTORE_PATH"
+          elif [ -f "$KEY" ]; then
             echo 'Signing source: restored permanent cache' | tee artifacts/signing-source.txt
           else
             echo 'RIGEAR_SIGNING_KEY_BASE64 is missing and no permanent cache exists.' >&2
             exit 1
           fi
-          chmod 600 "$RIGEAR_KEYSTORE_PATH"
-          ACTUAL_CERT="$(keytool -exportcert -alias androiddebugkey -keystore "$RIGEAR_KEYSTORE_PATH" -storepass android | openssl dgst -sha256 | awk '{print $2}')"
+          chmod 600 "$KEY"
+          echo "RIGEAR_KEYSTORE_PATH=$KEY" >> "$GITHUB_ENV"
+          ACTUAL_CERT="$(keytool -exportcert -alias androiddebugkey -keystore "$KEY" -storepass android | openssl dgst -sha256 | awk '{print $2}')"
           printf '%s\n' "$ACTUAL_CERT" | tee artifacts/expected-cert-sha256.txt
           test "$ACTUAL_CERT" = "$RIGEAR_CERT_SHA256"
-          keytool -list -v -alias androiddebugkey -keystore "$RIGEAR_KEYSTORE_PATH" -storepass android > artifacts/keystore-info.txt
-          cp "$RIGEAR_KEYSTORE_PATH" "$CACHE_KEY"
-          chmod 600 "$CACHE_KEY"
+          keytool -list -v -alias androiddebugkey -keystore "$KEY" -storepass android > artifacts/keystore-info.txt
       - name: Generate parameter catalog and integrate Neon UI
         run: |
           mkdir -p artifacts build/tests
