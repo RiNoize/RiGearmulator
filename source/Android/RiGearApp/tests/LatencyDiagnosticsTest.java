@@ -2,7 +2,7 @@ import com.rinoize.rigear.PlaybackQueueMeter;
 import com.rinoize.rigear.MeterWindow;
 import com.rinoize.rigear.MidiTelemetry;
 
-/** No Android/ROM dependency. Exercises queue accounting, wrap/reset and MIDI sustain semantics. */
+/** No Android/ROM dependency. Exercises queue accounting, adaptive sizing, wrap/reset and MIDI sustain semantics. */
 public final class LatencyDiagnosticsTest {
     private static void check(boolean ok, String message) {
         if (!ok) throw new AssertionError(message);
@@ -39,6 +39,16 @@ public final class LatencyDiagnosticsTest {
         check(wrap.pending(0xfffffff0) == written - 0xfffffff0L, "pre-wrap");
         check(wrap.pending(0x00000010) == written - 0x100000010L, "32 bit wrap");
 
+        check(PlaybackQueueMeter.nextAdaptiveBufferSize(512, 4104, 256) == 768, "adaptive 512 to 768");
+        check(PlaybackQueueMeter.nextAdaptiveBufferSize(1024, 4104, 256) == 1280, "adaptive 1024 to 1280");
+        check(PlaybackQueueMeter.nextAdaptiveBufferSize(1280, 4104, 256) == 1536, "adaptive monotonic step");
+        check(PlaybackQueueMeter.nextAdaptiveBufferSize(4096, 4104, 256) == 4104, "adaptive capacity clamp");
+        check(PlaybackQueueMeter.nextAdaptiveBufferSize(4104, 4104, 256) == 4104, "adaptive full capacity");
+        boolean invalidAdaptive = false;
+        try { PlaybackQueueMeter.nextAdaptiveBufferSize(1024, 512, 256); }
+        catch (IllegalArgumentException expected) { invalidAdaptive = true; }
+        check(invalidAdaptive, "invalid adaptive range rejected");
+
         MeterWindow window = new MeterWindow();
         window.sample(1_000_000_000L, new long[]{0,0,0,0,0}, 46875);
         double[] rates = window.sample(1_500_000_000L, new long[]{10,5120,60_000_000,12_000_000,3}, 46875);
@@ -74,6 +84,6 @@ public final class LatencyDiagnosticsTest {
         boolean rejected = false;
         try { t.accept(new byte[2], 1, 2); } catch (IllegalArgumentException expected) { rejected = true; }
         check(rejected, "invalid MIDI slice rejected");
-        System.out.println("LatencyDiagnostics: PASS (queue, partial writes, wrap, resets, OV/s, five notes + sustain, MIDI parser)");
+        System.out.println("LatencyDiagnostics: PASS (queue, adaptive buffer, partial writes, wrap, resets, OV/s, five notes + sustain, MIDI parser)");
     }
 }
