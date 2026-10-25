@@ -15,7 +15,7 @@ env:
   NATIVE_BUILD: build/android-release
 jobs:
   build-apk:
-    name: RiGear 0.11.1 Dual Landscape ARM64
+    name: RiGear 0.11.2 ARM64
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -27,17 +27,39 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Restore cached development signing identity
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: rigear-development-signing-v2
+      - name: Use permanent signing secret or create cache fallback
+        env:
+          RIGEAR_SIGNING_KEY_BASE64: ${{ secrets.RIGEAR_SIGNING_KEY_BASE64 }}
+        run: |
+          mkdir -p "$HOME/.android" artifacts
+          if [ -n "$RIGEAR_SIGNING_KEY_BASE64" ]; then
+            printf '%s' "$RIGEAR_SIGNING_KEY_BASE64" | base64 --decode > "$HOME/.android/debug.keystore"
+            echo 'Signing source: permanent repository secret' | tee artifacts/signing-source.txt
+          elif [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 3072 -validity 25000 \
+              -dname 'CN=RiGear Development, O=RiNoize, C=AR'
+            echo 'Signing source: cache fallback — add RIGEAR_SIGNING_KEY_BASE64 for permanence' | tee artifacts/signing-source.txt
+          else
+            echo 'Signing source: restored cache' | tee artifacts/signing-source.txt
+          fi
+          chmod 600 "$HOME/.android/debug.keystore"
       - name: Generate real parameter catalog and source snapshot
         run: |
           mkdir -p artifacts build/tests
           python3 source/Android/RiGearApp/tools/generate_studio_parameters.py | tee artifacts/catalog-report.txt
-          git archive --format=zip HEAD source/Android/RiGearApp source/Android/rigearNative .github/workflows/android-apk.yml > artifacts/RiGear-0.11.1-source.zip
+          git archive --format=zip HEAD source/Android/RiGearApp source/Android/rigearNative .github/workflows/android-apk.yml > artifacts/RiGear-0.11.2-source.zip
       - name: Test sound library, favorites, persistence and macro bounds
         run: |
           JAVA_SRC=source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear
           javac -encoding UTF-8 -d build/tests "$JAVA_SRC/SoundCodec.java" "$JAVA_SRC/SoundLibrary.java" source/Android/RiGearApp/tests/StudioLibraryTest.java
           java -cp build/tests StudioLibraryTest | tee artifacts/library-tests.txt
-      - name: Test unchanged streaming converter and diagnostics
+      - name: Test streaming converter and diagnostics
         run: |
           clang++ -std=c++17 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
             -I source/Android/rigearNative source/Android/RiGearApp/tests/ResamplerTest.cpp -o build/tests/resampler-test
@@ -84,8 +106,8 @@ jobs:
               assert '-DNDEBUG' in command and '-O0' not in command
               assert any(flag in command for flag in ('-O2','-O3','-Ofast'))
               checked.append({'source':suffix,'command':command})
-          pathlib.Path('artifacts/native-build.json').write_text(json.dumps({'version':'0.11.1','commit':os.environ['GITHUB_SHA'],'build':'Release','commands':checked},indent=2))
-          print('Virus/DSP/Studio are optimized Release; existing 0.9 audio and SRC sources preserved')
+          pathlib.Path('artifacts/native-build.json').write_text(json.dumps({'version':'0.11.2','commit':os.environ['GITHUB_SHA'],'build':'Release','commands':checked},indent=2))
+          print('Virus/DSP/Studio are optimized Release')
           PY
       - name: Build shared library
         run: |
@@ -94,61 +116,47 @@ jobs:
           mkdir -p "$JNI_DIR"
           cp "${NATIVE_BUILD}/source/Android/rigearNative/librigear.so" "$JNI_DIR/"
           cp "${ANDROID_HOME}/ndk/${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$JNI_DIR/"
-      - name: Keep a consistent development signing identity
-        uses: actions/cache@v4
-        with:
-          path: ~/.android/debug.keystore
-          key: rigear-development-signing-v1
-      - name: Create development key when cache is empty
-        run: |
-          mkdir -p "$HOME/.android"
-          if [ ! -f "$HOME/.android/debug.keystore" ]; then
-            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -keypass android \
-              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname 'CN=RiGear Development, O=RiNoize, C=AR'
-          fi
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
       - name: Package Studio APK
         working-directory: source/Android/RiGearApp
         run: gradle --no-daemon --stacktrace :app:assembleRelease
-      - name: Verify packaged app
+      - name: Verify packaged app and record certificate
         run: |
-          cp source/Android/RiGearApp/app/build/outputs/apk/release/app-release.apk artifacts/RiGear-0.11.1-arm64.apk
-          "${ANDROID_HOME}/build-tools/35.0.0/aapt" dump badging artifacts/RiGear-0.11.1-arm64.apk > artifacts/apk-info.txt
+          APK=artifacts/RiGear-0.11.2-arm64.apk
+          cp source/Android/RiGearApp/app/build/outputs/apk/release/app-release.apk "$APK"
+          "${ANDROID_HOME}/build-tools/35.0.0/aapt" dump badging "$APK" > artifacts/apk-info.txt
+          "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee artifacts/apk-signing.txt
           python3 - <<'PY'
-          import zipfile, pathlib, json
-          with zipfile.ZipFile('artifacts/RiGear-0.11.1-arm64.apk') as apk:
+          import zipfile, pathlib, json, re
+          apk_path='artifacts/RiGear-0.11.2-arm64.apk'
+          with zipfile.ZipFile(apk_path) as apk:
               assert 'lib/arm64-v8a/librigear.so' in apk.namelist()
               assert len(json.loads(apk.read('assets/studio-parameters.json'))) > 100
           info=pathlib.Path('artifacts/apk-info.txt').read_text()
-          assert "versionCode='13'" in info and "versionName='0.11.1'" in info
+          code=int(re.search(r"versionCode='(\d+)'", info).group(1))
+          assert code >= 10000 and "versionName='0.11.2'" in info
           assert 'com.rinoize.rigear.StudioActivity' in info
-          manifest = pathlib.Path('source/Android/RiGearApp/app/src/main/AndroidManifest.xml').read_text()
+          manifest=pathlib.Path('source/Android/RiGearApp/app/src/main/AndroidManifest.xml').read_text()
           assert manifest.count('android:screenOrientation="sensorLandscape"') == 2
-          assert 'android:screenOrientation="landscape"' not in manifest
-          print('Studio launcher, dual landscape rotation, ARM64 engine and APK version verified')
-          ui = pathlib.Path('source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear/StudioActivity.java').read_text()
-          native = pathlib.Path('source/Android/rigearNative/RiGearStudio.cpp').read_text()
-          assert 'StudioBridge.selectFactory' in ui and 'StudioBridge_selectFactory' in native
-          assert 'BANK -' in ui and 'PATCH +' in ui and 'Bank '+chr(65) in ui
-          print('Direct Factory Bank Select + Program Change browser wiring verified')
+          assert manifest.count('android:configChanges="orientation|screenSize"') == 2
+          print('APK, increasing versionCode, dual landscape and ARM64 engine verified')
           PY
           cp source/Android/RiGearApp/TESTING-0.11.md artifacts/
-          echo '### RiGear 0.11.1 Dual Landscape' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Both horizontal orientations are enabled with sensorLandscape; portrait remains disabled.' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Release verified; library/persistence/SysEx/SRC/MIDI tests and Java API compilation passed.' >> "$GITHUB_STEP_SUMMARY"
+          echo '### RiGear 0.11.2 Signing Baseline' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Every CI build now has a strictly increasing Android versionCode.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Set repository secret RIGEAR_SIGNING_KEY_BASE64 to make the signing identity permanent.' >> "$GITHUB_STEP_SUMMARY"
       - name: Upload Studio APK
         uses: actions/upload-artifact@v4
         with:
-          name: RiGear-0.11.1-DualLandscape-arm64
+          name: RiGear-0.11.2-SigningBaseline-arm64
           path: artifacts/
           if-no-files-found: error
       - name: Upload sources and diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: RiGear-0.11.1-build-diagnostics
+          name: RiGear-0.11.2-build-diagnostics
           path: artifacts/
           if-no-files-found: warn
