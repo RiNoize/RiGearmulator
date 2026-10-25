@@ -13,7 +13,7 @@ concurrency:
 env:
   NDK_VERSION: '27.2.12479018'
   NATIVE_BUILD: build/android-release
-  RIGEAR_CERT_SHA256: 'a945b140b5debca52bb00fd78d83332aebdb7f92b0865408a68c13ef500dbbca'
+  RIGEAR_CERT_SHA256: '30393306ce2796ea0effb1f199c0916c0cf7d2f2e88507c5a329e2f0f3e32775'
 jobs:
   build-apk:
     name: RiGear 0.12 Neon UI ARM64
@@ -28,25 +28,25 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Restore cached permanent signing identity
+      - name: Restore cached permanent signing identity V2
         uses: actions/cache@v4
         with:
-          path: ~/.android/rigear-development.keystore
-          key: rigear-permanent-signing-v1
-      - name: Bind permanent signing identity explicitly
+          path: ~/.android/rigear-development-v2.keystore
+          key: rigear-permanent-signing-v2
+      - name: Bind permanent signing identity V2 explicitly
         env:
-          RIGEAR_SIGNING_KEY_BASE64: ${{ secrets.RIGEAR_SIGNING_KEY_BASE64 }}
+          RIGEAR_SIGNING_KEY_BASE64_V2: ${{ secrets.RIGEAR_SIGNING_KEY_BASE64_V2 }}
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.android" artifacts
-          KEY="$HOME/.android/rigear-development.keystore"
-          if [ -n "$RIGEAR_SIGNING_KEY_BASE64" ]; then
-            printf '%s' "$RIGEAR_SIGNING_KEY_BASE64" | base64 --decode > "$KEY"
-            echo 'Signing source: permanent repository secret' | tee artifacts/signing-source.txt
+          KEY="$HOME/.android/rigear-development-v2.keystore"
+          if [ -n "$RIGEAR_SIGNING_KEY_BASE64_V2" ]; then
+            printf '%s' "$RIGEAR_SIGNING_KEY_BASE64_V2" | base64 --decode > "$KEY"
+            echo 'Signing source: permanent repository secret V2' | tee artifacts/signing-source.txt
           elif [ -f "$KEY" ]; then
-            echo 'Signing source: restored permanent cache' | tee artifacts/signing-source.txt
+            echo 'Signing source: restored permanent cache V2' | tee artifacts/signing-source.txt
           else
-            echo 'RIGEAR_SIGNING_KEY_BASE64 is missing and no permanent cache exists.' >&2
+            echo 'RIGEAR_SIGNING_KEY_BASE64_V2 is missing and no V2 cache exists.' >&2
             exit 1
           fi
           chmod 600 "$KEY"
@@ -130,7 +130,7 @@ jobs:
       - name: Package Studio APK
         working-directory: source/Android/RiGearApp
         run: gradle --no-daemon --stacktrace :app:assembleRelease
-      - name: Verify packaged app and permanent certificate
+      - name: Verify packaged app and permanent certificate V2
         run: |
           APK=artifacts/RiGear-0.12.0-NeonUI-arm64.apk
           cp source/Android/RiGearApp/app/build/outputs/apk/release/app-release.apk "$APK"
@@ -157,13 +157,13 @@ jobs:
           assert pathlib.Path('source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear/SynthDisplay.java').exists()
           manifest=pathlib.Path('source/Android/RiGearApp/app/src/main/AndroidManifest.xml').read_text()
           assert manifest.count('android:screenOrientation="sensorLandscape"') == 2
-          print('Neon UI, live scope, category browser, explicit permanent certificate, rotation and ARM64 engine verified')
+          print('Neon UI, live scope, category browser, permanent certificate V2, rotation and ARM64 engine verified')
           PY
           sha256sum "$APK" > artifacts/apk-sha256.txt
           cp source/Android/RiGearApp/TESTING-0.12.md artifacts/
           echo '### RiGear 0.12 Neon Hardware UI' >> "$GITHUB_STEP_SUMMARY"
           echo 'Black/graphite-blue skin, live output LCD, tabbed editor, grouped FX and category library verified.' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Gradle is explicitly bound to the permanent RiGear certificate; a mismatch fails CI.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Gradle is explicitly bound to the private RiGear V2 certificate; a mismatch fails CI.' >> "$GITHUB_STEP_SUMMARY"
       - name: Upload Studio APK
         uses: actions/upload-artifact@v4
         with:
