@@ -1,0 +1,35 @@
+plugins { id 'com.android.application' }
+
+def ciRunNumber = System.getenv('GITHUB_RUN_NUMBER')
+def rixeniaVersionCode = ciRunNumber ? 10000 + ciRunNumber.toInteger() : 1
+
+android {
+    namespace 'com.rinoize.rixenia'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    ndkVersion '27.2.12479018'
+    defaultConfig {
+        applicationId 'com.rinoize.rixenia'
+        minSdk 26
+        targetSdk 35
+        versionCode rixeniaVersionCode
+        versionName '0.1.0'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    sourceSets { main { jniLibs.srcDirs = ['src/main/jniLibs'] } }
+    buildTypes {
+        debug {
+            debuggable true
+            signingConfig signingConfigs.debug
+        }
+        release {
+            debuggable false
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

@@ -22,18 +22,14 @@ namespace wLib
 
 	void Hardware::haltDSP()
 	{
-		if(m_haltDSP)
-			return;
-
 		std::lock_guard uLockHalt(m_haltDSPmutex);
+		if(m_haltDSP || m_terminateUcThread)
+			return;
 		m_haltDSP = true;
 	}
 
 	void Hardware::resumeDSP()
 	{
-		if(!m_haltDSP)
-			return;
-
 		{
 			std::lock_guard uLockHalt(m_haltDSPmutex);
 			m_haltDSP = false;
@@ -43,7 +39,7 @@ namespace wLib
 
 	void Hardware::ucYieldLoop(const std::function<bool()>& _continue)
 	{
-		const auto dspHalted = m_haltDSP;
+		const auto dspHalted = m_haltDSP.load();
 
 		resumeDSP();
 
@@ -64,7 +60,11 @@ namespace wLib
 				// output ring being full, so the UC's wait condition can't
 				// resolve until audio processing resumes. Sleep until then.
 				std::unique_lock uLock(m_processAudioMutex);
-				m_processAudioCv.wait(uLock);
+				m_processAudioCv.wait(uLock, [&]
+				{
+					return m_processAudio.load(std::memory_order_acquire) ||
+						m_terminateUcThread.load() || !_continue();
+				});
 			}
 		}
 
@@ -74,13 +74,23 @@ namespace wLib
 
 	void Hardware::requestUcTermination()
 	{
-		m_terminateUcThread = true;
+		// Publish under the same locks used by both waiters; otherwise a
+		// notify between their condition check and sleep can be lost.
+		{
+			std::scoped_lock lock(m_processAudioMutex, m_esaiFrameAddedMutex);
+			m_terminateUcThread = true;
+		}
 		m_processAudioCv.notify_all();
+		m_esaiFrameAddedCv.notify_all();
+		resumeDSP();
 	}
 
 	void Hardware::beginProcessAudio()
 	{
-		m_processAudio.store(true, std::memory_order_release);
+		{
+			std::lock_guard lock(m_processAudioMutex);
+			m_processAudio.store(true, std::memory_order_release);
+		}
 		m_processAudioCv.notify_all();
 	}
 
@@ -106,7 +116,10 @@ namespace wLib
 		processMidiInput();
 
 		if((m_esaiFrameIndex & (g_syncEsaiFrameRate-1)) == 0)
+		{
+			std::lock_guard lock(m_esaiFrameAddedMutex);
 			m_esaiFrameAddedCv.notify_one();
+		}
 
 		m_processAudioCv.notify_all();
 
@@ -128,6 +141,8 @@ namespace wLib
 
 	void Hardware::syncUcToDSP()
 	{
+		if(m_terminateUcThread)
+			return;
 		if(m_remainingUcCycles > 0)
 			return;
 
@@ -139,10 +154,16 @@ namespace wLib
 		{
 			resumeDSP();
 			std::unique_lock uLock(m_esaiFrameAddedMutex);
-			m_esaiFrameAddedCv.wait(uLock, [this]{return m_esaiFrameIndex > m_lastEsaiFrameIndex;});
+			m_esaiFrameAddedCv.wait(uLock, [this]
+			{
+				return m_terminateUcThread || m_esaiFrameIndex > m_lastEsaiFrameIndex;
+			});
 		}
 
-		const auto esaiFrameIndex = m_esaiFrameIndex;
+		if(m_terminateUcThread)
+			return;
+
+		const auto esaiFrameIndex = m_esaiFrameIndex.load();
 
 		const auto ucClock = getUc().getSim().getSystemClockHz();
 

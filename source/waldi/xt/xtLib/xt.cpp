@@ -55,6 +55,9 @@ namespace xt
 		m_hw->processAudio(1);
 
 		m_destroy = true;
+		// The UC sleeps while audio is idle. Wake it as well as the DSP so
+		// unloading a stopped Android instrument can complete.
+		m_hw->requestUcTermination();
 
 		// DSP needs to run to let the uc thread wake up
 		const auto& esai = m_hw->getDSP(m_hw->getMainDspIdx()).getPeriph().getEssi0();
@@ -173,7 +176,7 @@ namespace xt
 
 	void Xt::processUcThread() const
 	{
-		for(size_t i=0; i<32; ++i)
+		for(size_t i=0; i<32 && !m_destroy; ++i)
 		{
 			m_hw->process();
 			m_hw->process();

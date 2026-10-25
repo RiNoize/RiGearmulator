@@ -68,7 +68,7 @@ namespace xt
 		std::vector<uint8_t> m_midiOutBuffer;
 
 		std::unique_ptr<std::thread> m_ucThread;
-		bool m_destroy = false;
+		std::atomic<bool> m_destroy{false};
 		std::atomic<uint32_t> m_dirtyFlags = 0;
 	};
 }

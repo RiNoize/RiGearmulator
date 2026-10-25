@@ -207,7 +207,11 @@ namespace xt
 
 	void Hardware::processUcCycle()
 	{
+		if(m_terminateUcThread)
+			return;
 		syncUcToDSP();
+		if(m_terminateUcThread)
+			return;
 
 		const auto deltaCycles = m_uc.exec();
 		if(m_esaiFrameIndex > 0)

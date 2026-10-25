@@ -63,7 +63,7 @@ namespace wLib
 
 		// timing
 		const double m_samplerateInv;
-		uint32_t m_esaiFrameIndex = 0;
+		std::atomic<uint32_t> m_esaiFrameIndex{0};
 		uint32_t m_lastEsaiFrameIndex = 0;
 		int64_t m_remainingUcCycles = 0;
 		double m_remainingUcCyclesD = 0;
@@ -81,7 +81,7 @@ namespace wLib
 		dsp56k::ConditionVariable m_requestedFramesAvailableCv;
 		size_t m_requestedFrames = 0;
 
-		bool m_haltDSP = false;
+		std::atomic<bool> m_haltDSP{false};
 		dsp56k::ConditionVariable m_haltDSPcv;
 		std::mutex m_haltDSPmutex;
 
@@ -93,7 +93,7 @@ namespace wLib
 		std::mutex m_processAudioMutex;
 		dsp56k::ConditionVariable m_processAudioCv;
 
-		bool m_bootCompleted = false;
-		bool m_terminateUcThread = false;
+		std::atomic<bool> m_bootCompleted{false};
+		std::atomic<bool> m_terminateUcThread{false};
 	};
 }

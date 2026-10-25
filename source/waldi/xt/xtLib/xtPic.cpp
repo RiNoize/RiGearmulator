@@ -124,7 +124,9 @@ namespace xt
 				if(_lcd.writeCharacter(ch))
 				{
 					m_cbkLcdDirty();
+#ifndef NDEBUG
 					MCLOG("LCD:\n" << _lcd.toString());
+#endif
 				}
 
 				return 0;

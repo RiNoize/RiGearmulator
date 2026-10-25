@@ -59,7 +59,11 @@ endif()
 add_subdirectory(framework/tools/synthLibTests)
 add_subdirectory(3rdparty/libresample)
 
-add_subdirectory(3rdparty)
+# These are the desktop editor's RmlUi/Lua/font/SVG dependencies. Native-only
+# hosts (including the Android apps) do not use them or require their submodules.
+if(${CMAKE_PROJECT_NAME}_BUILD_JUCEPLUGIN)
+	add_subdirectory(3rdparty)
+endif()
 
 include(cmake/macsetup.cmake)
 include(cmake/skins.cmake)
@@ -217,8 +221,13 @@ add_subdirectory(claudia)
 
 add_subdirectory(ronaldo)
 
-# ----------------- RiGear Android native bridge
+# ----------------- Android native bridges
 
 if(ANDROID)
-	add_subdirectory(Android/rigearNative EXCLUDE_FROM_ALL)
+	if(TARGET virusLib)
+		add_subdirectory(Android/rigearNative EXCLUDE_FROM_ALL)
+	endif()
+	if(TARGET xtLib)
+		add_subdirectory(Android/rixeniaNative EXCLUDE_FROM_ALL)
+	endif()
 endif()
