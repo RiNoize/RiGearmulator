@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Generate Android editor controls from the actual Osirus parameter definitions."""
+"""Generate Android editor controls and apply the checked-in RiGear UI integration."""
 import json
 import pathlib
 import re
+import subprocess
+import sys
 
 root = pathlib.Path(__file__).resolve().parents[4]
 source = root / 'source/axel/osirusJucePlugin/parameterDescriptions_C.json'
 text = source.read_text(encoding='utf-8')
-# Remove comments only outside JSON strings, retaining strings byte-for-byte.
 text = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/',
               lambda match: match.group(1) or '', text, flags=re.S)
 text = re.sub(r',\s*([}\]])', r'\1', text)
@@ -52,3 +53,10 @@ out = root / 'source/Android/RiGearApp/app/src/main/assets/studio-parameters.jso
 out.parent.mkdir(parents=True, exist_ok=True)
 out.write_text(json.dumps(controls, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
 print(f'Generated {len(controls)} real Osirus A/B/C controls; 7 arpeggiator values and ringmod mapping verified')
+subprocess.run([sys.executable, str(root / 'source/Android/RiGearApp/tools/apply_neon_ui.py')], check=True)
+# Keep the custom graphite drawable intact on EditText; Android background tint would flatten it.
+ui_path = root / 'source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear/StudioUi.java'
+ui_text = ui_path.read_text(encoding='utf-8')
+ui_text = ui_text.replace('import android.content.res.ColorStateList;\n', '')
+ui_text = ui_text.replace('        if (android.os.Build.VERSION.SDK_INT >= 21) field.setBackgroundTintList(ColorStateList.valueOf(0xffffffff));\n', '')
+ui_path.write_text(ui_text, encoding='utf-8')

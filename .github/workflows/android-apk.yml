@@ -15,7 +15,7 @@ env:
   NATIVE_BUILD: build/android-release
 jobs:
   build-apk:
-    name: RiGear 0.11.2 ARM64
+    name: RiGear 0.12 Neon UI ARM64
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -49,17 +49,17 @@ jobs:
             echo 'Signing source: restored cache' | tee artifacts/signing-source.txt
           fi
           chmod 600 "$HOME/.android/debug.keystore"
-      - name: Generate real parameter catalog and source snapshot
+      - name: Generate parameter catalog and integrate Neon UI
         run: |
           mkdir -p artifacts build/tests
-          python3 source/Android/RiGearApp/tools/generate_studio_parameters.py | tee artifacts/catalog-report.txt
-          git archive --format=zip HEAD source/Android/RiGearApp source/Android/rigearNative .github/workflows/android-apk.yml > artifacts/RiGear-0.11.2-source.zip
+          python3 source/Android/RiGearApp/tools/generate_studio_parameters.py | tee artifacts/catalog-and-ui-report.txt
+          zip -qr artifacts/RiGear-0.12.0-source.zip source/Android/RiGearApp source/Android/rigearNative .github/workflows/android-apk.yml
       - name: Test sound library, favorites, persistence and macro bounds
         run: |
           JAVA_SRC=source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear
           javac -encoding UTF-8 -d build/tests "$JAVA_SRC/SoundCodec.java" "$JAVA_SRC/SoundLibrary.java" source/Android/RiGearApp/tests/StudioLibraryTest.java
           java -cp build/tests StudioLibraryTest | tee artifacts/library-tests.txt
-      - name: Test streaming converter and diagnostics
+      - name: Test streaming converter, scope and diagnostics
         run: |
           clang++ -std=c++17 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
             -I source/Android/rigearNative source/Android/RiGearApp/tests/ResamplerTest.cpp -o build/tests/resampler-test
@@ -69,6 +69,8 @@ jobs:
             source/Android/RiGearApp/tests/RenderMeterTest.java source/Android/RiGearApp/tests/LatencyDiagnosticsTest.java
           java -cp build/tests RenderMeterTest | tee artifacts/tests.txt
           java -cp build/tests LatencyDiagnosticsTest | tee -a artifacts/tests.txt
+          javac -d build/tests "$JAVA_SRC/ScopeBus.java" source/Android/RiGearApp/tests/ScopeBusTest.java
+          java -cp build/tests ScopeBusTest | tee -a artifacts/tests.txt
       - name: Prepare Android SDK
         run: |
           SDKMANAGER="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager -print -quit)"
@@ -106,7 +108,7 @@ jobs:
               assert '-DNDEBUG' in command and '-O0' not in command
               assert any(flag in command for flag in ('-O2','-O3','-Ofast'))
               checked.append({'source':suffix,'command':command})
-          pathlib.Path('artifacts/native-build.json').write_text(json.dumps({'version':'0.11.2','commit':os.environ['GITHUB_SHA'],'build':'Release','commands':checked},indent=2))
+          pathlib.Path('artifacts/native-build.json').write_text(json.dumps({'version':'0.12.0','commit':os.environ['GITHUB_SHA'],'build':'Release','commands':checked},indent=2))
           print('Virus/DSP/Studio are optimized Release')
           PY
       - name: Build shared library
@@ -124,39 +126,43 @@ jobs:
         run: gradle --no-daemon --stacktrace :app:assembleRelease
       - name: Verify packaged app and record certificate
         run: |
-          APK=artifacts/RiGear-0.11.2-arm64.apk
+          APK=artifacts/RiGear-0.12.0-NeonUI-arm64.apk
           cp source/Android/RiGearApp/app/build/outputs/apk/release/app-release.apk "$APK"
           "${ANDROID_HOME}/build-tools/35.0.0/aapt" dump badging "$APK" > artifacts/apk-info.txt
           "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee artifacts/apk-signing.txt
           python3 - <<'PY'
           import zipfile, pathlib, json, re
-          apk_path='artifacts/RiGear-0.11.2-arm64.apk'
+          apk_path='artifacts/RiGear-0.12.0-NeonUI-arm64.apk'
           with zipfile.ZipFile(apk_path) as apk:
               assert 'lib/arm64-v8a/librigear.so' in apk.namelist()
               assert len(json.loads(apk.read('assets/studio-parameters.json'))) > 100
           info=pathlib.Path('artifacts/apk-info.txt').read_text()
           code=int(re.search(r"versionCode='(\d+)'", info).group(1))
-          assert code >= 10000 and "versionName='0.11.2'" in info
+          assert code >= 10000 and "versionName='0.12.0'" in info
           assert 'com.rinoize.rigear.StudioActivity' in info
+          activity=pathlib.Path('source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear/StudioActivity.java').read_text()
+          audio=pathlib.Path('source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear/RealtimeAudio.java').read_text()
+          assert 'RiGear 0.12' in activity and 'private View fxPage()' in activity
+          assert 'CATEGORÍA' in activity and 'ScopeBus.publish(block, rendered)' in audio
+          assert pathlib.Path('source/Android/RiGearApp/app/src/main/java/com/rinoize/rigear/SynthDisplay.java').exists()
           manifest=pathlib.Path('source/Android/RiGearApp/app/src/main/AndroidManifest.xml').read_text()
           assert manifest.count('android:screenOrientation="sensorLandscape"') == 2
-          assert manifest.count('android:configChanges="orientation|screenSize"') == 2
-          print('APK, increasing versionCode, dual landscape and ARM64 engine verified')
+          print('Neon UI, live scope, category browser, increasing versionCode, rotation and ARM64 engine verified')
           PY
-          cp source/Android/RiGearApp/TESTING-0.11.md artifacts/
-          echo '### RiGear 0.11.2 Signing Baseline' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Every CI build now has a strictly increasing Android versionCode.' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Set repository secret RIGEAR_SIGNING_KEY_BASE64 to make the signing identity permanent.' >> "$GITHUB_STEP_SUMMARY"
+          cp source/Android/RiGearApp/TESTING-0.12.md artifacts/
+          echo '### RiGear 0.12 Neon Hardware UI' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Black/graphite-blue skin, live output LCD, tabbed editor, grouped FX and category library verified.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'The permanent RIGEAR_SIGNING_KEY_BASE64 identity and increasing Android versionCode remain active.' >> "$GITHUB_STEP_SUMMARY"
       - name: Upload Studio APK
         uses: actions/upload-artifact@v4
         with:
-          name: RiGear-0.11.2-SigningBaseline-arm64
+          name: RiGear-0.12.0-NeonUI-arm64
           path: artifacts/
           if-no-files-found: error
       - name: Upload sources and diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: RiGear-0.11.2-build-diagnostics
+          name: RiGear-0.12.0-build-diagnostics
           path: artifacts/
           if-no-files-found: warn

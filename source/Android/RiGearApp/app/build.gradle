@@ -1,7 +1,7 @@
 plugins { id 'com.android.application' }
 
 def ciRunNumber = System.getenv('GITHUB_RUN_NUMBER')
-def rigearVersionCode = ciRunNumber ? 10000 + ciRunNumber.toInteger() : 14
+def rigearVersionCode = ciRunNumber ? 10000 + ciRunNumber.toInteger() : 10050
 
 android {
     namespace 'com.rinoize.rigear'
@@ -12,7 +12,7 @@ android {
         minSdk 26
         targetSdk 35
         versionCode rigearVersionCode
-        versionName '0.11.2'
+        versionName '0.12.0'
         ndk { abiFilters 'arm64-v8a' }
     }
     sourceSets { main { jniLibs.srcDirs = ['src/main/jniLibs'] } }
