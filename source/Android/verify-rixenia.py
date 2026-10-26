@@ -54,6 +54,12 @@ def apk(path, badging):
     assert "application-debuggable" not in info, "APK must not be debuggable"
     assert "launchable-activity: name='com.rinoize.rixenia.MainActivity'" in info
     assert "native-code: 'arm64-v8a'" in info
+    signature = Path(badging).with_name("apk-signing.txt").read_text()
+    match = re.search(r"Signer #1 certificate SHA-256 digest: ([0-9a-f]{64})", signature)
+    assert match, "Missing APK signing certificate report"
+    certificate = match.group(1)
+    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+        assert certificate == "30393306ce2796ea0effb1f199c0916c0cf7d2f2e88507c5a329e2f0f3e32775", "APK was not signed with the permanent V2 key"
     libraries = {}
     with zipfile.ZipFile(path) as package:
         names = package.namelist()
@@ -62,7 +68,7 @@ def apk(path, badging):
             libraries[name] = elf_alignment(package.read(name), name)
         assert not any(name.startswith("lib/") and name.split("/")[1] != "arm64-v8a" for name in names)
     return {"applicationId": "com.rinoize.rixenia.v2", "versionName": "0.1.1",
-            "versionCode": version_code, "debuggable": False, "elfLoadAlignments": libraries}
+            "versionCode": version_code, "debuggable": False, "signingCertificateSha256": certificate, "elfLoadAlignments": libraries}
 
 
 def main():
