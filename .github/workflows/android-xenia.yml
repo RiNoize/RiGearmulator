@@ -1,28 +1,11 @@
 name: RiXenia Android APK
-
 on:
   workflow_dispatch:
   push:
     branches: [android-xenia]
     paths: ['.github/workflows/android-xenia.yml', 'CMakeLists.txt', 'source/**', '.gitmodules']
   pull_request:
-    paths:
-      - '.github/workflows/android-xenia.yml'
-      - 'CMakeLists.txt'
-      - '.gitmodules'
-      - 'source/CMakeLists.txt'
-      - 'source/cmake/**'
-      - 'source/Android/RiXeniaApp/**'
-      - 'source/Android/rixeniaNative/**'
-      - 'source/Android/build-rixenia-native.sh'
-      - 'source/Android/verify-rixenia.py'
-      - 'source/cpu/**'
-      - 'source/framework/baseLib/**'
-      - 'source/framework/synthLib/**'
-      - 'source/framework/hardwareLib/**'
-      - 'source/waldi/common/**'
-      - 'source/waldi/xt/xtLib/**'
-
+    paths: ['.github/workflows/android-xenia.yml', 'source/Android/**', 'source/waldi/**', 'source/framework/**', 'source/cpu/**', 'source/CMakeLists.txt']
 permissions:
   contents: read
 defaults:
@@ -34,57 +17,37 @@ concurrency:
 env:
   RIXENIA_NDK_VERSION: '27.2.12479018'
   RIXENIA_BUILD_DIR: ${{ github.workspace }}/build/android-xenia-release
-
 jobs:
   build-apk:
-    name: RiXenia 0.1.1 ARM64
+    name: RiXenia 0.1.1 ARM64 V2
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      - name: Fetch the pinned DSP and MC68K cores
+      - name: Fetch pinned emulator cores
         run: git submodule update --init --recursive --depth 1 source/cpu/dsp56300 source/cpu/mc68k
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      - name: Record source revision and Android source snapshot
+      - name: Source revision and Android changes
         run: |
           mkdir -p artifacts build/rixenia-tests
           git rev-parse HEAD > artifacts/source-revision.txt
           git submodule status --recursive >> artifacts/source-revision.txt
           git archive --format=zip HEAD source/Android/RiXeniaApp source/Android/rixeniaNative \
-            source/Android/build-rixenia-native.sh source/Android/verify-rixenia.py \
-            source/waldi/common/wLib/wHardware.h source/waldi/common/wLib/wHardware.cpp \
-            source/waldi/xt/xtLib/xt.h source/waldi/xt/xtLib/xt.cpp source/waldi/xt/xtLib/xtHardware.cpp source/waldi/xt/xtLib/xtPic.cpp \
-            source/waldi/xt/xtLib/xtDevice.h source/waldi/xt/xtLib/xtDevice.cpp \
-            source/CMakeLists.txt .github/workflows/android-xenia.yml > artifacts/RiXenia-0.1.1-android-source.zip
-      - name: Archive complete build sources without firmware or signing material
-        run: |
-          tar --exclude='./.git' --exclude='*/.git' --exclude='./build' --exclude='./artifacts' \
-            -czf /tmp/RiXenia-0.1.1-full-source.tar.gz .
-          mkdir -p source-artifacts
-          mv /tmp/RiXenia-0.1.1-full-source.tar.gz source-artifacts/
-      - name: Upload complete build sources
-        uses: actions/upload-artifact@v4
-        with:
-          name: RiXenia-0.1.1-full-source
-          path: source-artifacts/
-          retention-days: 90
-      - name: Test preset files, retained libraries and output sizing
+            source/Android/build-rixenia-native.sh source/Android/verify-rixenia.py source/waldi/common/wLib \
+            source/waldi/xt/xtLib source/CMakeLists.txt .github/workflows/android-xenia.yml > artifacts/RiXenia-0.1.1-android-source.zip
+      - name: Parser, output sizing, dispatch, SRC and lifecycle tests
         run: |
           JAVA_SRC=source/Android/RiXeniaApp/app/src/main/java/com/rinoize/rixenia
-          javac -encoding UTF-8 -d build/rixenia-tests \
-            "$JAVA_SRC/BankFile.java" "$JAVA_SRC/PatchLibrary.java" "$JAVA_SRC/AudioSizing.java" "$JAVA_SRC/RomFile.java" \
-            source/Android/RiXeniaApp/tests/BankFileTest.java source/Android/RiXeniaApp/tests/AudioSizingTest.java \
-            source/Android/RiXeniaApp/tests/RomFileTest.java
-          java -cp build/rixenia-tests BankFileTest | tee artifacts/preset-tests.txt
-          java -cp build/rixenia-tests AudioSizingTest | tee artifacts/output-sizing-tests.txt
-          java -cp build/rixenia-tests RomFileTest | tee artifacts/rom-import-tests.txt
-      - name: Test native MIDI validation and streaming conversion
-        run: |
+          javac -encoding UTF-8 -d build/rixenia-tests "$JAVA_SRC/BankFile.java" "$JAVA_SRC/PatchLibrary.java" \
+            "$JAVA_SRC/AudioSizing.java" "$JAVA_SRC/RomFile.java" source/Android/RiXeniaApp/tests/*Test.java
+          for test in BankFileTest AudioSizingTest RomFileTest; do
+            java -cp build/rixenia-tests "$test" | tee "artifacts/$test.txt"
+          done
           for test in source/Android/RiXeniaApp/tests/*Test.cpp; do
             name="$(basename "$test" .cpp)"
             if [ "$name" = XeniaLifecycleTest ]; then continue; fi
@@ -92,64 +55,48 @@ jobs:
               -I source/Android/rixeniaNative "$test" -o "build/rixenia-tests/$name"
             "build/rixenia-tests/$name" | tee "artifacts/$name.txt"
           done
-      - name: Test actual Waldorf UC idle wake and shutdown
-        run: |
           clang++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
             -I source/framework -isystem source/cpu -isystem source/cpu/dsp56300/source -I source/waldi/common \
             source/Android/RiXeniaApp/tests/XeniaLifecycleTest.cpp source/waldi/common/wLib/wHardware.cpp \
             -Wl,--gc-sections -o build/rixenia-tests/XeniaLifecycleTest
           timeout 15s build/rixenia-tests/XeniaLifecycleTest | tee artifacts/XeniaLifecycleTest.txt
-      - name: Restore fallback development signing identity
-        if: github.event_name != 'pull_request'
-        uses: actions/cache@v4
-        with:
-          # The permanent signing secret is written to debug.keystore below.
-          # Never cache that path: public repository caches are not secret storage.
-          path: ~/.android/rixenia-fallback.keystore
-          key: rixenia-development-signing-v2
-      - name: Select signing identity
+      - name: Require V2 signing identity; never cache the private key
         env:
-          RIGEAR_SIGNING_KEY_BASE64: ${{ github.event_name != 'pull_request' && secrets.RIGEAR_SIGNING_KEY_BASE64 || '' }}
+          RIGEAR_SIGNING_KEY_BASE64_V2: ${{ github.event_name != 'pull_request' && secrets.RIGEAR_SIGNING_KEY_BASE64_V2 || '' }}
         run: |
           mkdir -p "$HOME/.android"
-          if [ -n "$RIGEAR_SIGNING_KEY_BASE64" ]; then
-            printf '%s' "$RIGEAR_SIGNING_KEY_BASE64" | base64 --decode > "$HOME/.android/debug.keystore"
-            echo 'Signing source: permanent repository secret' > artifacts/signing-source.txt
+          if [ "${{ github.event_name }}" = 'pull_request' ]; then
+            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 3072 -validity 365 -dname 'CN=RiXenia CI Only, O=RiNoize, C=AR'
+            echo 'Signing source: ephemeral PR test key, not a distributable update' > artifacts/signing-source.txt
           else
-            if [ ! -f "$HOME/.android/rixenia-fallback.keystore" ]; then
-              keytool -genkeypair -keystore "$HOME/.android/rixenia-fallback.keystore" -storepass android -keypass android \
-                -alias androiddebugkey -keyalg RSA -keysize 3072 -validity 25000 \
-                -dname 'CN=RiXenia Development, O=RiNoize, C=AR'
-              echo 'Signing source: development fallback' > artifacts/signing-source.txt
-            else
-              echo 'Signing source: restored development cache' > artifacts/signing-source.txt
-            fi
-            chmod 600 "$HOME/.android/rixenia-fallback.keystore"
-            cp "$HOME/.android/rixenia-fallback.keystore" "$HOME/.android/debug.keystore"
+            test -n "$RIGEAR_SIGNING_KEY_BASE64_V2" || { echo 'Missing RIGEAR_SIGNING_KEY_BASE64_V2; no random replacement key permitted.' >&2; exit 1; }
+            printf '%s' "$RIGEAR_SIGNING_KEY_BASE64_V2" | base64 --decode > "$HOME/.android/debug.keystore"
+            ACTUAL_CERT="$(keytool -exportcert -alias androiddebugkey -keystore "$HOME/.android/debug.keystore" -storepass android | openssl dgst -sha256 | awk '{print $2}')"
+            test "$ACTUAL_CERT" = '30393306ce2796ea0effb1f199c0916c0cf7d2f2e88507c5a329e2f0f3e32775'
+            echo 'Signing source: permanent repository secret V2' > artifacts/signing-source.txt
           fi
           chmod 600 "$HOME/.android/debug.keystore"
-      - name: Prepare Android SDK
+      - name: Android SDK and Java API verification
         run: |
           SDKMANAGER="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager -print -quit)"
           test -x "$SDKMANAGER"
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" 'platforms;android-35' 'build-tools;35.0.0' 'cmake;3.22.1' "ndk;${RIXENIA_NDK_VERSION}"
-      - name: Compile Android API usage
-        run: |
           mkdir -p build/rixenia-java-api-check
           javac -encoding UTF-8 -source 17 -target 17 -cp "${ANDROID_HOME}/platforms/android-35/android.jar" \
             -d build/rixenia-java-api-check source/Android/RiXeniaApp/app/src/main/java/com/rinoize/rixenia/*.java
-      - name: Build the optimized ARM64 Xenia engine
+      - name: Optimized ARM64 Xenia engine
         run: |
           bash source/Android/build-rixenia-native.sh
           python3 source/Android/verify-rixenia.py native "${RIXENIA_BUILD_DIR}" --report artifacts/native-build.json
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Package RiXenia APK
+      - name: Package RiXenia V2 APK
         working-directory: source/Android/RiXeniaApp
         run: gradle --no-daemon --stacktrace :app:assembleRelease
-      - name: Verify APK, signing certificate and 16 KiB alignment
+      - name: Verify APK, signature and 16 KiB alignment
         run: |
           APK=artifacts/RiXenia-0.1.1-arm64.apk
           cp source/Android/RiXeniaApp/app/build/outputs/apk/release/app-release.apk "$APK"
@@ -158,18 +105,18 @@ jobs:
           "${ANDROID_HOME}/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "$APK" > artifacts/apk-alignment.txt
           python3 source/Android/verify-rixenia.py apk "$APK" --badging artifacts/apk-info.txt --report artifacts/apk-verification.json
           cp source/Android/RiXeniaApp/README.md artifacts/README-RiXenia.md
-          echo '### RiXenia 0.1.1 ARM64' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Separate Microwave II/XT application: com.rinoize.rixenia.' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Release APK, signature, ARM64 ELF alignment and host tests verified.' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Audio and performance on a physical tablet still require the user’s full 256 KiB firmware and preset banks.' >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload APK, Android sources and verification reports
+          echo '### RiXenia 0.1.1 ARM64 V2' >> "$GITHUB_STEP_SUMMARY"
+          echo 'com.rinoize.rixenia.v2 installs beside 0.1.0; preserve the old app and import ROM/banks into V2.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Release build, host tests, signature and ELF alignment verified. Physical tablet validation pending.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload APK, Android sources and reports
+        if: success() && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: RiXenia-0.1.1-arm64
           path: artifacts/
           retention-days: 90
           if-no-files-found: error
-      - name: Upload diagnostics on failure
+      - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:

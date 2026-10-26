@@ -1,5 +1,6 @@
 #include "XeniaDispatch.h"
 #include <iostream>
+#include <memory_resource>
 #include <stdexcept>
 
 using rixenia::Bytes;
@@ -34,7 +35,8 @@ int main() {
     change.request(a,1000); auto ga=change.generation();
     check(change.phase(1001)==1,"Intent shown as active");
     check(!change.confirm(rixenia::singleEdit(a),ga,1002),"Unsent cached patch falsely acknowledged");
-    change.dispatched(a); check(change.phase(1002)==2,"Dispatch state missing");
+    std::pmr::vector<std::uint8_t> nativeBuffer(a.begin(), a.end());
+    change.dispatched(nativeBuffer); check(change.phase(1002)==2,"Dispatch state missing");
     change.request(b,1010); auto gb=change.generation();
     change.dispatched(a); check(!change.sent(),"Obsolete dump marked latest patch sent");
     change.dispatched(b);

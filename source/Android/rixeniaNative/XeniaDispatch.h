@@ -39,7 +39,7 @@ public:
             throw std::invalid_argument("Invalid Single patch transaction");
         target_ = singleEdit(single); sent_ = false; started_ = nowMs; ++generation_;
     }
-    void dispatched(const Bytes& single) {
+    template<class Container> void dispatched(const Container& single) {
         if (pending() && samePayload(single, target_)) sent_ = true;
     }
     bool confirm(const Bytes& actual, std::uint64_t queryGeneration, std::int64_t nowMs) {
@@ -60,7 +60,7 @@ public:
         return sent_ ? 2 : 1;
     }
     int lastMs() const noexcept { return lastMs_; }
-    static bool samePayload(const Bytes& a, const Bytes& b) noexcept {
+    template<class A, class B> static bool samePayload(const A& a, const B& b) noexcept {
         return a.size() == singleSize && b.size() == singleSize && a[4] == 0x10 && b[4] == 0x10 &&
             std::equal(a.begin() + 7, a.begin() + 263, b.begin() + 7);
     }

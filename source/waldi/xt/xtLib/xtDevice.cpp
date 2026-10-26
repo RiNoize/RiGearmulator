@@ -66,7 +66,7 @@ namespace xt
             if (data.size() == 265 && data[0] == 0xf0 && data[1] == 0x3e &&
                 data[2] == 0x0e && data[4] == 0x10 && data[5] == 0x20 &&
                 data[6] == 0 && data.back() == 0xf7) {
-                m_firmwareSingle = data;
+                m_firmwareSingle.assign(data.begin(), data.end());
                 ++m_firmwareSingleRevision;
             }
         }
