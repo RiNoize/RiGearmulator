@@ -27,6 +27,12 @@ namespace xt
 
 		bool canModifyDspClock() const override { return true; }
 
+        // Audio/control thread only, serialized with process(). Bypasses State's
+        // optimistic editor cache; the revision advances only on hardware RX.
+        void requestSingleFromFirmware();
+        uint64_t getFirmwareSingleRevision() const { return m_firmwareSingleRevision; }
+        const std::vector<uint8_t>& getFirmwareSingle() const { return m_firmwareSingle; }
+
 	protected:
 		void readMidiOut(std::vector<synthLib::SMidiEvent>& _midiOut) override;
 		void processAudio(const synthLib::TAudioInputs& _inputs, const synthLib::TAudioOutputs& _outputs, size_t _samples) override;
@@ -35,6 +41,8 @@ namespace xt
 		dsp56k::EsxiClock* getDspEsxiClock() const override;
 	private:
 
+        std::vector<uint8_t> m_firmwareSingle;
+        uint64_t m_firmwareSingleRevision = 0;
 		Xt m_xt;
 		WavePreview m_wavePreview;
 		State m_state;

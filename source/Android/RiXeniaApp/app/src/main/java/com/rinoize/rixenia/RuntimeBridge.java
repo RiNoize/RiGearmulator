@@ -10,7 +10,8 @@ public final class RuntimeBridge {
     public static native void panic();
     public static native void setGainDb(int db);
     public static native void setParameter(int index, int value);
-    /** revision, bank, program, then 256 current single parameters; unknown values are -1. */
+    /** revision, bank, program, then 256 parameters, phase, last confirmation ms, pending ms, MIDI queue, SysEx queue.
+     * Values are confirmed through firmware RX, not the editor cache; unknown values are -1. */
     public static native int[] panel();
     public static native void requestPanel();
     public static native long[] signalStats(boolean reset);

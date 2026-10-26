@@ -19,6 +19,7 @@
 #include "synthLib/device.h"
 #include "XeniaProtocol.h"
 #include "XeniaResampler.h"
+#include "XeniaDispatch.h"
 
 namespace {
 using Event = synthLib::SMidiEvent;
@@ -44,6 +45,15 @@ std::array<std::array<bool, 128>, 16> seenNotes{};
 int selectedBank = 0, selectedProgram = 0;
 std::uint32_t revision = 1;
 bool requestPanel = true;
+bool singleModeScheduled = false;
+rixenia::MidiDispatch dispatch;
+rixenia::PatchChange patchChange;
+int queryRetryFrames = 0;
+std::uint64_t queryGeneration = 0;
+std::int64_t nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 std::uint64_t midiMessages = 0, midiNotes = 0, midiCc = 0, midiPc = 0, midiBend = 0;
 std::uint64_t midiSysex = 0, midiRejected = 0, midiOverflow = 0;
 unsigned heldNotes = 0;
@@ -107,15 +117,18 @@ bool enqueueShortLocked(std::uint8_t a, std::uint8_t b, std::uint8_t c) {
     if (shortQueue.size() >= maxShortEvents) { ++midiOverflow; return false; }
     shortQueue.emplace_back(synthLib::MidiEventSource::Host, a, b, c, 0); return true;
 }
-void cacheSingleLocked(const Bytes& single) {
-    for (std::size_t i = 0; i < parameters.size(); ++i) parameters[i] = single[7 + i];
-    ++revision;
+void ensureSingleModeLocked() {
+    if (!singleModeScheduled) {
+        if (!enqueueSysexLocked({0xf0, 0x3e, 0x0e, 0x7f, 0x17, 0, 0xf7}))
+            throw std::runtime_error("Cola de modo Single llena.");
+        singleModeScheduled = true;
+    }
 }
 void removePendingEditLocked() {
     for (auto it = sysexQueue.begin(); it != sysexQueue.end();) {
         const auto& s = it->sysex;
         if ((s.size() == 265 && s[4] == 0x10 && s[5] == 0x20) ||
-            (s.size() == 10 && s[4] == 0x20) || (s.size() == 7 && (s[4] == 0x17 || s[4] == 0x27))) {
+            (s.size() == 10 && s[4] == 0x20)) {
             sysexBytes -= s.size(); it = sysexQueue.erase(it);
         } else ++it;
     }
@@ -126,11 +139,12 @@ bool selectPatchLocked(int bank, int program) {
     if (sysexQueue.size() + 2 > maxSysexEvents || sysexBytes + 272 > maxQueuedSysexBytes)
         throw std::runtime_error("La cola SysEx esta llena; espere y vuelva a elegir el sonido.");
     removePendingEditLocked();
-    enqueueSysexLocked({0xf0, 0x3e, 0x0e, 0x7f, 0x17, 0, 0xf7});
+    ensureSingleModeLocked();
     enqueueSysexLocked(rixenia::singleEdit(patch));
     selectedBank = bank; selectedProgram = program;
     midiBanks.fill(static_cast<unsigned>(bank));
-    cacheSingleLocked(patch); requestPanel = true;
+    patchChange.request(patch, nowMs());
+    queryRetryFrames = 0; requestPanel = true; ++revision;
     return true;
 }
 void panicLocked(bool discard) {
@@ -180,9 +194,8 @@ bool receiveShortLocked(std::uint8_t a, std::uint8_t b, std::uint8_t c) {
         if (midiBanks[channel] < 2 && selectPatchLocked(static_cast<int>(midiBanks[channel]), b)) return true;
         selectedBank = midiBanks[channel] < 2 ? static_cast<int>(midiBanks[channel]) : -1;
         selectedProgram = b; parameters.fill(-1); ++revision;
-        // Firmware PC does not invalidate the upstream edit-buffer cache. Keep
-        // the panel unknown instead of showing the previous patch as this one.
-        requestPanel = false;
+        removePendingEditLocked(); patchChange.reset();
+        requestPanel = true; queryRetryFrames = 4000;
     }
     return enqueueShortLocked(a, b, c);
 }
@@ -237,6 +250,8 @@ Java_com_rinoize_rixenia_NativeBridge_nativeLoadRom(JNIEnv* env, jclass, jbyteAr
             for (auto& channel : notes) channel.fill(false);
             for (auto& channel : seenNotes) channel.fill(false);
             heldNotes = 0; parameters.fill(-1); requestPanel = true; ++revision;
+            singleModeScheduled = false; patchChange.reset(); dispatch.reset();
+            queryRetryFrames = 0; queryGeneration = 0;
         }
         synthLib::DeviceCreateParams params;
         params.romData = std::move(rom); params.romName = std::move(filename);
@@ -248,7 +263,7 @@ Java_com_rinoize_rixenia_NativeBridge_nativeLoadRom(JNIEnv* env, jclass, jbyteAr
         finishFirmwareSetup();
         {
             std::lock_guard<std::mutex> midiLock(midiMutex);
-            enqueueSysexLocked({0xf0, 0x3e, 0x0e, 0x7f, 0x17, 0, 0xf7});
+            ensureSingleModeLocked();
             if (selectedBank >= 0 && selectedBank < 2) selectPatchLocked(selectedBank, selectedProgram);
         }
         clearMeters();
@@ -301,6 +316,8 @@ Java_com_rinoize_rixenia_NativeBridge_nativeSendMidiBytes(JNIEnv* env, jclass, j
             auto normalized = *sysex;
             normalized[3] = 0x7f;
             if (rixenia::validDump(normalized)) rixenia::normalizeDump(normalized);
+            if (normalized.size() == 7 && (normalized[4] == 0x17 || normalized[4] == 0x27))
+                singleModeScheduled = normalized[5] == 0;
             return enqueueSysexLocked(normalized);
         });
         if (!ok) ++midiRejected;
@@ -347,6 +364,7 @@ Java_com_rinoize_rixenia_NativeBridge_nativeSelectPatch(JNIEnv* env, jclass, jin
         if (!selectPatchLocked(bank, program)) {
             selectedBank = bank; selectedProgram = program;
             midiBanks.fill(static_cast<unsigned>(bank));
+            removePendingEditLocked(); patchChange.reset();
             parameters.fill(-1); ++revision; requestPanel = true;
             return env->NewStringUTF("");
         }
@@ -391,6 +409,7 @@ Java_com_rinoize_rixenia_NativeBridge_nativeRelease(JNIEnv* env, jclass) {
         std::lock_guard<std::mutex> midiLock(midiMutex);
         shortQueue.clear(); sysexQueue.clear(); sysexBytes = 0; decoder.reset();
         parameters.fill(-1); ++revision;
+        patchChange.reset(); dispatch.reset(); singleModeScheduled = false; queryRetryFrames = 0;
         for (auto& channel : notes) channel.fill(false);
         for (auto& channel : seenNotes) channel.fill(false);
         heldNotes = 0;
@@ -468,43 +487,44 @@ Java_com_rinoize_rixenia_RuntimeBridge_render(JNIEnv* env, jclass, jfloatArray b
             std::fill(outputs[i].begin(), outputs[i].end(), 0.0f); out[i] = outputs[i].data();
         }
         midiIn.clear(); midiOut.clear(); sysexCooldown = std::max(0, sysexCooldown - frames);
+        bool queryFirmware = false;
+        auto* xtDevice = static_cast<xt::Device*>(device.get());
+        const auto oldFirmwareRevision = xtDevice->getFirmwareSingleRevision();
         {
             std::lock_guard<std::mutex> midiLock(midiMutex);
-            // Physical MIDI needs ~0.96 ms for a three-byte message. A burst of
-            // 192 messages can overrun the firmware receive ring even though
-            // the emulator's queue itself is unbounded. Space them at 1 ms.
+            queryRetryFrames = std::max(0, queryRetryFrames - frames);
+            if (patchChange.sent() && !queryRetryFrames) requestPanel = true;
             const auto shortBudget = static_cast<std::size_t>(std::max(1, frames / 40));
-            if (!sysexCooldown && !shortQueue.empty()) {
+            const bool hasControl = !sysexQueue.empty() || (requestPanel && !queryRetryFrames);
+            const auto next = dispatch.choose(!shortQueue.empty(), hasControl, sysexCooldown);
+            if (next == rixenia::MidiDispatch::Next::Channel) {
                 while (!shortQueue.empty() && midiIn.size() < shortBudget) {
                     const auto offset = static_cast<std::uint32_t>(midiIn.size() * 40);
                     midiIn.emplace_back(std::move(shortQueue.front())); shortQueue.pop_front();
                     midiIn.back().offset = offset;
                 }
-            // Let the firmware finish a SysEx before adding channel messages.
-            // A pending Panic and patch at Play must not compete for its small
-            // receive buffer. Short events take priority between complete dumps.
-            } else if (!sysexCooldown && !sysexQueue.empty()) {
+            } else if (next == rixenia::MidiDispatch::Next::Control && !sysexQueue.empty()) {
                 const auto count = sysexQueue.front().sysex.size();
                 const bool modeChange = count == 7 && sysexQueue.front().sysex[4] == 0x17;
+                patchChange.dispatched(sysexQueue.front().sysex);
                 midiIn.emplace_back(std::move(sysexQueue.front())); sysexQueue.pop_front(); sysexBytes -= count;
-                // A mode change loads a firmware preset before accepting the
-                // next edit-buffer dump; its seven wire bytes are not the cost.
+                // Keep the firmware's existing safe pacing. Fix starvation, not
+                // the UART clock. Mode setup occurs once, not on every patch.
                 sysexCooldown = modeChange ? 4000 : static_cast<int>(count * 8 + 256);
-            } else if (!sysexCooldown && sysexQueue.empty() && requestPanel) {
-                midiIn.emplace_back(sysexEvent({0xf0, 0x3e, 0x0e, 0x7f, 0x00, 0x20, 0, 0xf7}));
-                requestPanel = false; sysexCooldown = 256;
+            } else if (next == rixenia::MidiDispatch::Next::Control) {
+                queryFirmware = true; queryGeneration = patchChange.generation();
+                requestPanel = false; queryRetryFrames = 16000; sysexCooldown = 256;
             }
         }
+        if (queryFirmware) xtDevice->requestSingleFromFirmware();
         device->process(in, out, static_cast<std::size_t>(frames), midiIn, midiOut);
-        for (const auto& event : midiOut) {
-            const auto& s = event.sysex;
-            if (s.size() == rixenia::singleSize && s[0] == 0xf0 && s[1] == 0x3e && s[2] == 0x0e &&
-                s[4] == 0x10 && s[5] == 0x20 && s[6] == 0 && s.back() == 0xf7) {
+        if (xtDevice->getFirmwareSingleRevision() != oldFirmwareRevision) {
+            const auto& actual = xtDevice->getFirmwareSingle();
+            if (rixenia::validDump(actual)) {
                 std::lock_guard<std::mutex> midiLock(midiMutex);
-                // Upstream can answer from its edit cache; a newer queued patch
-                // remains the authoritative UI state until it reaches the engine.
-                if (sysexQueue.empty()) {
-                    for (std::size_t i = 0; i < 256; ++i) parameters[i] = s[7 + i];
+                const bool confirmed = patchChange.confirm(actual, queryGeneration, nowMs());
+                if (confirmed || !patchChange.pending()) {
+                    for (std::size_t i = 0; i < 256; ++i) parameters[i] = actual[7 + i];
                     ++revision;
                 }
             }
@@ -553,6 +573,7 @@ Java_com_rinoize_rixenia_RuntimeBridge_setParameter(JNIEnv* env, jclass, jint in
         if (index < 0 || index > 255 || value < 0 || value > 127)
             throw std::invalid_argument("Parametro Xenia fuera de rango.");
         std::lock_guard<std::mutex> lock(midiMutex);
+        if (patchChange.pending()) throw std::runtime_error("Espere la confirmacion del patch antes de editar.");
         Bytes message{0xf0, 0x3e, 0x0e, 0x7f, 0x20, 0,
             static_cast<std::uint8_t>(index >> 7), static_cast<std::uint8_t>(index & 127),
             static_cast<std::uint8_t>(value), 0xf7};
@@ -570,11 +591,14 @@ Java_com_rinoize_rixenia_RuntimeBridge_setParameter(JNIEnv* env, jclass, jint in
 extern "C" JNIEXPORT jintArray JNICALL
 Java_com_rinoize_rixenia_RuntimeBridge_panel(JNIEnv* env, jclass) {
     return guarded<jintArray>(env, nullptr, [&] {
-        std::array<jint, 259> values{};
+        std::array<jint, 264> values{};
         {
             std::lock_guard<std::mutex> lock(midiMutex);
             values[0] = static_cast<jint>(revision & 0x7fffffffu); values[1] = selectedBank; values[2] = selectedProgram;
             for (std::size_t i = 0; i < 256; ++i) values[3 + i] = parameters[i];
+            values[259] = patchChange.phase(nowMs()); values[260] = patchChange.lastMs();
+            values[261] = patchChange.elapsedMs(nowMs());
+            values[262] = static_cast<jint>(shortQueue.size()); values[263] = static_cast<jint>(sysexQueue.size());
         }
         auto result = env->NewIntArray(static_cast<jsize>(values.size()));
         if (result) env->SetIntArrayRegion(result, 0, static_cast<jsize>(values.size()), values.data());

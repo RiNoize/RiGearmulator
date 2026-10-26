@@ -37,7 +37,7 @@ env:
 
 jobs:
   build-apk:
-    name: RiXenia 0.1.0 ARM64
+    name: RiXenia 0.1.1 ARM64
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -59,7 +59,20 @@ jobs:
             source/Android/build-rixenia-native.sh source/Android/verify-rixenia.py \
             source/waldi/common/wLib/wHardware.h source/waldi/common/wLib/wHardware.cpp \
             source/waldi/xt/xtLib/xt.h source/waldi/xt/xtLib/xt.cpp source/waldi/xt/xtLib/xtHardware.cpp source/waldi/xt/xtLib/xtPic.cpp \
-            source/CMakeLists.txt .github/workflows/android-xenia.yml > artifacts/RiXenia-0.1.0-android-source.zip
+            source/waldi/xt/xtLib/xtDevice.h source/waldi/xt/xtLib/xtDevice.cpp \
+            source/CMakeLists.txt .github/workflows/android-xenia.yml > artifacts/RiXenia-0.1.1-android-source.zip
+      - name: Archive complete build sources without firmware or signing material
+        run: |
+          tar --exclude='./.git' --exclude='*/.git' --exclude='./build' --exclude='./artifacts' \
+            -czf /tmp/RiXenia-0.1.1-full-source.tar.gz .
+          mkdir -p source-artifacts
+          mv /tmp/RiXenia-0.1.1-full-source.tar.gz source-artifacts/
+      - name: Upload complete build sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: RiXenia-0.1.1-full-source
+          path: source-artifacts/
+          retention-days: 90
       - name: Test preset files, retained libraries and output sizing
         run: |
           JAVA_SRC=source/Android/RiXeniaApp/app/src/main/java/com/rinoize/rixenia
@@ -138,21 +151,21 @@ jobs:
         run: gradle --no-daemon --stacktrace :app:assembleRelease
       - name: Verify APK, signing certificate and 16 KiB alignment
         run: |
-          APK=artifacts/RiXenia-0.1.0-arm64.apk
+          APK=artifacts/RiXenia-0.1.1-arm64.apk
           cp source/Android/RiXeniaApp/app/build/outputs/apk/release/app-release.apk "$APK"
           "${ANDROID_HOME}/build-tools/35.0.0/aapt" dump badging "$APK" > artifacts/apk-info.txt
           "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee artifacts/apk-signing.txt
           "${ANDROID_HOME}/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "$APK" > artifacts/apk-alignment.txt
           python3 source/Android/verify-rixenia.py apk "$APK" --badging artifacts/apk-info.txt --report artifacts/apk-verification.json
           cp source/Android/RiXeniaApp/README.md artifacts/README-RiXenia.md
-          echo '### RiXenia 0.1.0 ARM64' >> "$GITHUB_STEP_SUMMARY"
+          echo '### RiXenia 0.1.1 ARM64' >> "$GITHUB_STEP_SUMMARY"
           echo 'Separate Microwave II/XT application: com.rinoize.rixenia.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Release APK, signature, ARM64 ELF alignment and host tests verified.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Audio and performance on a physical tablet still require the user’s full 256 KiB firmware and preset banks.' >> "$GITHUB_STEP_SUMMARY"
       - name: Upload APK, Android sources and verification reports
         uses: actions/upload-artifact@v4
         with:
-          name: RiXenia-0.1.0-arm64
+          name: RiXenia-0.1.1-arm64
           path: artifacts/
           retention-days: 90
           if-no-files-found: error
@@ -160,7 +173,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: RiXenia-0.1.0-build-diagnostics
+          name: RiXenia-0.1.1-build-diagnostics
           path: artifacts/
           retention-days: 90
           if-no-files-found: warn

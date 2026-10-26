@@ -57,7 +57,19 @@ namespace xt
 	{
 		m_xt.receiveMidi(m_midiOutBuffer);
 		m_midiOutParser.write(m_midiOutBuffer);
+        const auto firstHardwareEvent = _midiOut.size();
 		m_midiOutParser.getEvents(_midiOut);
+        // _midiOut may already contain synthetic replies from sendMidi(). Only
+        // newly parsed UART messages are evidence of firmware receipt.
+        for (size_t i = firstHardwareEvent; i < _midiOut.size(); ++i) {
+            const auto& data = _midiOut[i].sysex;
+            if (data.size() == 265 && data[0] == 0xf0 && data[1] == 0x3e &&
+                data[2] == 0x0e && data[4] == 0x10 && data[5] == 0x20 &&
+                data[6] == 0 && data.back() == 0xf7) {
+                m_firmwareSingle = data;
+                ++m_firmwareSingleRevision;
+            }
+        }
 		m_midiOutBuffer.clear();
 
 		wLib::Responses responses;
@@ -129,6 +141,13 @@ namespace xt
 		}
 		return true;
 	}
+
+    void Device::requestSingleFromFirmware()
+    {
+        synthLib::SMidiEvent event(synthLib::MidiEventSource::Internal);
+        event.sysex = {0xf0, 0x3e, 0x0e, 0x7f, 0x00, 0x20, 0, 0xf7};
+        m_xt.sendMidiEvent(event);
+    }
 
 	dsp56k::EsxiClock* Device::getDspEsxiClock() const
 	{

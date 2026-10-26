@@ -37,6 +37,7 @@ public final class MainActivity extends Activity {
     private volatile boolean ready,destroyed,visible,midiGate;
     private boolean busy,nativeOk,syncing,currentKnown;
     private int page,bank,program,revision=-1,gainDb=-6;
+    private int patchPhase,lastPatchMs=-1,queuedMidi,queuedSysex;
     private long cpuBefore,wallBefore;
     private String romName="Sin ROM",lastError="",liveName="";
     private volatile PatchLibrary library=new PatchLibrary();
@@ -51,6 +52,12 @@ public final class MainActivity extends Activity {
     private interface Job { void run() throws Exception; }
     private final Runnable tick=new Runnable(){public void run(){if(!visible||destroyed)return;refreshMeters();ui.postDelayed(this,1000);}};
 
+    private final Runnable patchTick=new Runnable(){public void run(){
+        if(!visible||destroyed)return;
+        refreshPatchState();
+        if(patchPhase!=0)ui.postDelayed(this,patchPhase==3?500:100);
+    }};
+
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         prefs=getSharedPreferences("rixenia-v1",MODE_PRIVATE);
@@ -61,7 +68,7 @@ public final class MainActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN|View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
         LinearLayout root=column();root.setBackgroundColor(BG);root.setPadding(dp(10),dp(6),dp(10),dp(5));
         LinearLayout header=row();TextView title=text("RiXenia",22,ORANGE);title.setTypeface(Typeface.DEFAULT,Typeface.BOLD);header.addView(title);
-        TextView sub=text("  Microwave II / XT  ·  0.1.0 α",12,MUTED);header.addView(sub,new LinearLayout.LayoutParams(0,-2,1));
+        TextView sub=text("  Microwave II / XT  ·  0.1.1 α",12,MUTED);header.addView(sub,new LinearLayout.LayoutParams(0,-2,1));
         play=button("▶ INICIAR",ORANGE,v->startAudio());stop=button("■ DETENER",BLUE,v->stopAudio());
         header.addView(play);header.addView(stop);header.addView(button("PANIC",0xffff7787,v->panic()));root.addView(header);
         stats=text("Motor detenido",11,MUTED);root.addView(stats);
@@ -124,7 +131,9 @@ public final class MainActivity extends Activity {
         try{
             liveName="";currentKnown=false;String name=NativeBridge.nativeSelectPatch(targetBank,targetProgram);bank=targetBank;program=targetProgram;liveName=name==null?"":name;
             prefs.edit().putInt("bank",bank).putInt("program",program).apply();RuntimeBridge.requestPanel();revision=-1;
-            refreshDisplay();message(library.has(bank,program)?"Sonido seleccionado":"Posición vacía elegida para importar. Podés seguir tocando el sonido actual; su nombre aparece como ACTUAL.");
+            refreshPatchState();refreshDisplay();controls();
+            message(library.has(bank,program)?"Cambio solicitado: esperando confirmación del firmware.":"Posición vacía elegida para importar; el motor conserva el sonido actual.");
+            ui.removeCallbacks(patchTick);ui.post(patchTick);
         }catch(RuntimeException e){message(e.getMessage());}
     }
     private void stepPatch(int delta){
@@ -175,9 +184,14 @@ public final class MainActivity extends Activity {
         play.setEnabled(available&&ready&&!audio.hasLiveSession());stop.setEnabled(available&&audio.hasLiveSession());
         for(Button b:needsEngine)b.setEnabled(available&&ready);
         if(romButton!=null)romButton.setEnabled(available);if(bankButton!=null)bankButton.setEnabled(available);
-        for(Slider s:sliders)s.bar.setEnabled(available&&ready&&s.known);
+        for(Slider s:sliders)s.bar.setEnabled(available&&ready&&s.known&&patchPhase==0);
     }
     private void refreshDisplay(){
+        if(patchPhase!=0){
+            String label=!audio.isRunning()?"PENDIENTE · INICIAR":patchPhase==3?"SIN CONFIRMAR":"CARGANDO";
+            display.setText(String.format(Locale.ROOT,"%s%03d · %s\n%s",bank==0?"A":"B",program+1,label,library.name(bank,program)));
+            return;
+        }
         boolean imported=library.has(bank,program);
         String name=liveName;
         if(name.isEmpty())name=library.name(bank,program);
@@ -260,20 +274,48 @@ public final class MainActivity extends Activity {
             if(session!=measured){measured=session;renderWindow.reset();}
             if(session!=null&&audio.isRunning()){
                 long[] totals=session.meter.snapshot();double[] window=renderWindow.sample(System.nanoTime(),totals,session.deviceSampleRate);
-                stats.setText(String.format(Locale.ROOT,"Render %.1f%%  ·  CPU app %.1f%%  ·  OV %d (%.1f/s)  ·  underruns %d  ·  %d → %d Hz",window[0],appCpu,totals[4],window[1],session.underruns,session.deviceSampleRate,session.sampleRate));
+                stats.setText(String.format(Locale.ROOT,"Render %.1f%%  ·  CPU app %.1f%%  ·  OV %d · %.1f OV/s  ·  underruns %d  ·  %d → %d Hz",window[0],appCpu,totals[4],window[1],session.underruns,session.deviceSampleRate,session.sampleRate));
                 if(diagnostics!=null){RealtimeAudio.OutputState s=session.output;diagnostics.setText(session.configuration+"\nSalida: "+s.effectiveFrames+" frames / capacidad "+s.capacityFrames+" · "+RealtimeAudio.performanceName(s.performanceMode)+"\n"+s.route+(session.monitorNote.isEmpty()?"":"\n"+session.monitorNote));}
             }else stats.setText(String.format(Locale.ROOT,"%s  ·  CPU app %.1f%%",busy?"Preparando motor…":"Motor detenido",appCpu));
             if(session!=null&&!session.error.isEmpty()&&!session.error.equals(lastError)){lastError=session.error;message(session.error);midiGate=false;}
-            if(ready&&!busy){int[] state=RuntimeBridge.panel();if(state!=null&&state.length==259&&state[0]!=revision){revision=state[0];if(state[1]>=0&&state[1]<2&&state[2]>=0&&state[2]<128){bank=state[1];program=state[2];prefs.edit().putInt("bank",bank).putInt("program",program).apply();}
-                    currentKnown=true;for(int i=0;i<256;++i)if(state[3+i]<0){currentKnown=false;break;}
-                    StringBuilder n=new StringBuilder();if(currentKnown)for(int i=240;i<256;++i){int c=state[3+i];if(c>=32&&c<127)n.append((char)c);else n.append(' ');}liveName=n.toString().trim();
-                    syncing=true;for(Slider s:sliders){int value=state[3+s.index];s.known=currentKnown&&value>=0;s.bar.setEnabled(s.known&&!busy);if(s.known&&!s.bar.isPressed()){s.bar.setProgress(value);s.value.setText(Integer.toString(value));}else if(!s.known)s.value.setText("—");}syncing=false;refreshDisplay();}}
+            refreshPatchState();
+            if(patchPhase!=0){ui.removeCallbacks(patchTick);ui.postDelayed(patchTick,100);}
             if(midi!=null){long[] telemetry=midi.telemetry.snapshot();footer.setText(midi.status+" · msgs "+telemetry[0]+" · teclas "+telemetry[3]+" · pedal "+(telemetry[4]==0?"OFF":"ON"));}controls();
+        }catch(RuntimeException|LinkageError e){message(e.getMessage());}
+    }
+    private void refreshPatchState(){
+        if(!ready||busy||!nativeOk)return;
+        try{
+            int[] state=RuntimeBridge.panel();if(state==null||state.length!=264)return;
+            int previous=patchPhase;patchPhase=state[259];lastPatchMs=state[260];queuedMidi=state[262];queuedSysex=state[263];
+            if(state[0]!=revision||previous!=patchPhase){
+                revision=state[0];
+                if(state[1]>=0&&state[1]<2&&state[2]>=0&&state[2]<128){
+                    bank=state[1];program=state[2];prefs.edit().putInt("bank",bank).putInt("program",program).apply();
+                }
+                currentKnown=patchPhase==0;
+                for(int i=0;i<256;++i)if(state[3+i]<0){currentKnown=false;break;}
+                StringBuilder n=new StringBuilder();
+                if(currentKnown)for(int i=240;i<256;++i){int c=state[3+i];n.append(c>=32&&c<127?(char)c:' ');}
+                liveName=n.toString().trim();
+                syncing=true;
+                for(Slider slider:sliders){
+                    int value=state[3+slider.index];slider.known=currentKnown&&value>=0;
+                    slider.bar.setEnabled(slider.known&&!busy);
+                    if(slider.known&&!slider.bar.isPressed()){slider.bar.setProgress(value);slider.value.setText(Integer.toString(value));}
+                    else if(!slider.known)slider.value.setText("—");
+                }
+                syncing=false;
+            }
+            if(patchPhase!=0&&audio.isRunning())message(String.format(Locale.ROOT,
+                "%s · %.1f s · cola MIDI %d / SysEx %d",patchPhase==3?"El firmware aún no confirmó el sonido":"Aplicando patch",state[261]/1000.0,queuedMidi,queuedSysex));
+            else if(previous!=0&&patchPhase==0&&lastPatchMs>=0)message("Patch confirmado por el firmware en "+lastPatchMs+" ms (no es latencia de audio).");
+            refreshDisplay();controls();
         }catch(RuntimeException|LinkageError e){message(e.getMessage());}
     }
     @Override protected void onResume(){super.onResume();visible=true;cpuBefore=android.os.Process.getElapsedCpuTime();wallBefore=SystemClock.elapsedRealtime();ui.removeCallbacks(tick);ui.post(tick);}
     @Override protected void onStop(){
-        visible=false;midiGate=false;ui.removeCallbacks(tick);super.onStop();
+        visible=false;midiGate=false;ui.removeCallbacks(tick);ui.removeCallbacks(patchTick);super.onStop();
         ENGINE.execute(()->{try{stopWorker();if(ready&&nativeOk)RuntimeBridge.panic();}catch(Exception|LinkageError e){post(()->message(e.getMessage()));}});
     }
     @Override protected void onDestroy(){
