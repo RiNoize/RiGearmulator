@@ -27,13 +27,15 @@ public final class MainActivity extends Activity {
     private static final ExecutorService ENGINE=Executors.newSingleThreadExecutor();
     private static volatile boolean engineUnsafe;
     private static final int PICK_ROM=201,PICK_BANK=202;
-    private static final int BG=0xff11151b,PANEL=0xff202731,FG=0xffeaf1f7,MUTED=0xffa9b9c8,ORANGE=0xffff9b3f,BLUE=0xff77caff;
+    private static final int BG=SynthUi.BG,PANEL=SynthUi.PANEL,FG=SynthUi.TEXT,MUTED=SynthUi.MUTED,ORANGE=SynthUi.ORANGE,BLUE=SynthUi.CYAN;
     private static final int[] BLOCKS={256,512,1024},RATES={48000,0},OUTPUTS={512,768,1024,1536,2048,2304,3072,4096};
     private final Handler ui=new Handler(Looper.getMainLooper());
     private final RealtimeAudio audio=new RealtimeAudio();
     private final MeterWindow renderWindow=new MeterWindow();
     private final List<Button> needsEngine=new ArrayList<>();
-    private final List<Slider> sliders=new ArrayList<>();
+    private final List<Button> navTabs=new ArrayList<>();
+    private XeniaEditor editor;
+    private final int[] editorValues=new int[256];
     private volatile boolean ready,destroyed,visible,midiGate;
     private boolean busy,nativeOk,syncing,currentKnown;
     private int page,bank,program,revision=-1,gainDb=-6;
@@ -60,6 +62,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        java.util.Arrays.fill(editorValues,-1);
         prefs=getSharedPreferences("rixenia-v1",MODE_PRIVATE);
         // Preserve the old 4096-frame choice: new entries must not reinterpret index 5.
         if(!prefs.getBoolean("output-options-012",false)) {
@@ -73,20 +76,20 @@ public final class MainActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN|View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
         LinearLayout root=column();root.setBackgroundColor(BG);root.setPadding(dp(10),dp(6),dp(10),dp(5));
         LinearLayout header=row();TextView title=text("RiXenia",22,ORANGE);title.setTypeface(Typeface.DEFAULT,Typeface.BOLD);header.addView(title);
-        TextView sub=text("  Microwave II / XT  ·  0.1.2 α",12,MUTED);header.addView(sub,new LinearLayout.LayoutParams(0,-2,1));
+        TextView sub=text("  Microwave II / XT  ·  0.2.0 α",12,MUTED);header.addView(sub,new LinearLayout.LayoutParams(0,-2,1));
         play=button("▶ INICIAR",ORANGE,v->startAudio());stop=button("■ DETENER",BLUE,v->stopAudio());
-        header.addView(play);header.addView(stop);header.addView(button("PANIC",0xffff7787,v->panic()));root.addView(header);
+        addTransport(header,play);addTransport(header,stop);addTransport(header,button("PANIC",0xffff7787,v->panic()));root.addView(header,new LinearLayout.LayoutParams(-1,dp(40)));
         stats=text("Motor detenido",11,MUTED);root.addView(stats);
         LinearLayout patchBar=row();patchBar.setPadding(0,dp(6),0,dp(6));
         addEngineButton(patchBar,"BANK −",v->stepBank());
         addEngineButton(patchBar,"PATCH −",v->stepPatch(-1));
-        display=text("Cargar ROM\nImportar banco de sonidos",19,0xffd7edff);display.setTypeface(Typeface.MONOSPACE);display.setGravity(Gravity.CENTER);display.setMinHeight(dp(60));display.setMaxLines(2);display.setBackground(shape(0xff07388c,dp(4)));display.setPadding(dp(5),dp(3),dp(5),dp(3));
-        display.setOnClickListener(v->showPage(1));patchBar.addView(display,new LinearLayout.LayoutParams(0,dp(63),1));
+        display=text("Cargar ROM\nImportar banco de sonidos",19,0xffd7edff);display.setTypeface(Typeface.MONOSPACE);display.setGravity(Gravity.CENTER);display.setMinHeight(dp(54));display.setMaxLines(2);display.setBackground(new SynthUi.LcdBackground(this));display.setPadding(dp(5),dp(3),dp(5),dp(3));
+        display.setOnClickListener(v->showPage(1));patchBar.addView(display,new LinearLayout.LayoutParams(0,dp(57),1));
         addEngineButton(patchBar,"PATCH +",v->stepPatch(1));addEngineButton(patchBar,"BANK +",v->stepBank());root.addView(patchBar);
-        LinearLayout tabs=row();for(int i=0;i<3;++i){final int selected=i;Button b=button(new String[]{"TOCAR / EDITAR","BANCOS","CONFIGURACIÓN"}[i],BLUE,v->showPage(selected));tabs.addView(b,new LinearLayout.LayoutParams(0,dp(38),1));}root.addView(tabs);
+        LinearLayout tabs=row();for(int i=0;i<3;++i){final int selected=i;Button b=button(new String[]{"TOCAR / EDITAR","BANCOS","CONFIGURACIÓN"}[i],BLUE,v->showPage(selected));navTabs.add(b);LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,dp(38),1);lp.setMargins(dp(2),0,dp(2),0);tabs.addView(b,lp);}root.addView(tabs);
         body=new FrameLayout(this);root.addView(body,new LinearLayout.LayoutParams(-1,0,1));
-        status=text("Cargá tu ROM BIN/ZIP, pulsá INICIAR y mantené NOTA C4 para la primera prueba.",12,FG);status.setMaxLines(2);root.addView(status);
-        footer=text("MIDI desconectado",11,MUTED);footer.setMaxLines(2);root.addView(footer);setContentView(root);
+        status=text("Cargá tu ROM BIN/ZIP, pulsá INICIAR y mantené NOTA C4 para la primera prueba.",12,FG);status.setMaxLines(1);status.setEllipsize(android.text.TextUtils.TruncateAt.END);root.addView(status);
+        footer=text("MIDI desconectado",11,MUTED);footer.setMaxLines(1);footer.setEllipsize(android.text.TextUtils.TruncateAt.END);root.addView(footer);setContentView(root);
         try{nativeOk=NativeBridge.nativeSelfTest()==1;}catch(RuntimeException|LinkageError e){message("No se pudo cargar el motor: "+e.getMessage());}
         midi=new MidiInput(this,ui,()->midiGate&&audio.isRunning()&&!destroyed,()->{if(page==2)refreshPorts();});
         showPage(0);controls();
@@ -172,8 +175,7 @@ public final class MainActivity extends Activity {
                 BankFile imported=BankFile.parse(AppFiles.read(this,uri,BankFile.MAX_BYTES),destBank,destProgram);
                 PatchLibrary next=library.merged(imported);
                 stopWorker();
-                // A 4 MB SMF may repeat dumps. Deduplicate its fixed address space before
-                // JNI; valid singles/waves/tables occupy < 256 KiB, below native's 1 MiB cap.
+                // Deduplicate the fixed address space before JNI.
                 if(ready)NativeBridge.nativeImportSysex(new PatchLibrary().merged(imported).bytes());
                 AppFiles.atomic(new File(getFilesDir(),"banks.syx"),next.bytes());library=next;
                 List<Integer> slots=library.slots();
@@ -189,12 +191,13 @@ public final class MainActivity extends Activity {
         play.setEnabled(available&&ready&&!audio.hasLiveSession());stop.setEnabled(available&&audio.hasLiveSession());
         for(Button b:needsEngine)b.setEnabled(available&&ready);
         if(romButton!=null)romButton.setEnabled(available);if(bankButton!=null)bankButton.setEnabled(available);
-        for(Slider s:sliders)s.bar.setEnabled(available&&ready&&s.known&&patchPhase==0);
+        if(editor!=null)editor.setAvailable(available&&ready&&currentKnown&&patchPhase==0,available&&ready);
     }
+    private void setDisplay(String text){if(!text.contentEquals(display.getText()))display.setText(text);}
     private void refreshDisplay(){
         if(patchPhase!=0){
             String label=!audio.isRunning()?"PENDIENTE · INICIAR":patchPhase==3?"SIN CONFIRMAR":"CARGANDO";
-            display.setText(String.format(Locale.ROOT,"%s%03d · %s\n%s",bank==0?"A":"B",program+1,label,library.name(bank,program)));
+            setDisplay(String.format(Locale.ROOT,"%s%03d · %s\n%s",bank==0?"A":"B",program+1,label,library.name(bank,program)));
             return;
         }
         boolean imported=library.has(bank,program);
@@ -203,46 +206,39 @@ public final class MainActivity extends Activity {
         if(name.isEmpty())name=ready?(currentKnown?"(nombre vacío)":"Iniciá para consultar"):"Cargar ROM BIN / ZIP";
         String slot=String.format(Locale.ROOT,"%s%03d",bank==0?"A":"B",program+1);
         String heading=imported?slot+"  ·  SINGLE":currentKnown?"ACTUAL · destino "+slot:"DESTINO "+slot;
-        display.setText(heading+"\n"+name);
+        setDisplay(heading+"\n"+name);
     }
     private void showPage(int selected){
-        page=selected;sliders.clear();romButton=bankButton=null;diagnostics=null;body.removeAllViews();
-        LinearLayout content=column();content.setPadding(0,dp(8),0,dp(6));
-        if(page==0)buildPlay(content);else if(page==1)buildBanks(content);else buildConfig(content);
-        ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);scroll.addView(content);body.addView(scroll,new FrameLayout.LayoutParams(-1,-1));
-        refreshDisplay();controls();
-    }
-    private void buildPlay(LinearLayout content){
-        LinearLayout intro=row();TextView hint=text("WAVETABLE SYNTHESIZER",12,ORANGE);intro.addView(hint,new LinearLayout.LayoutParams(0,-2,1));
-        Button test=button("NOTA C4  ·  mantener",BLUE,null);test.setOnTouchListener((v,e)->{
-            if(!ready||busy||!audio.isRunning())return false;
-            try{if(e.getActionMasked()==MotionEvent.ACTION_DOWN){NativeBridge.nativeNoteOn(60,100);return true;}
-                if(e.getActionMasked()==MotionEvent.ACTION_UP||e.getActionMasked()==MotionEvent.ACTION_CANCEL){NativeBridge.nativeNoteOff(60);if(e.getActionMasked()==MotionEvent.ACTION_UP)v.performClick();return true;}}
-            catch(RuntimeException error){message(error.getMessage());}return true;
-        });intro.addView(test);content.addView(intro);
-        // Indices/ranges are from upstream parameterDescriptions_xt.json, never Virus mappings.
-        addSliderRow(content,new String[]{"Wavetable","Wave 1 inicio","Wave 2 inicio"},new int[]{25,26,36},new int[]{127,63,63});
-        addSliderRow(content,new String[]{"Filtro 1 cutoff","Resonancia","Filtro 2 cutoff"},new int[]{62,63,73},new int[]{127,127,127});
-        addSliderRow(content,new String[]{"Amp ataque","Amp sustain","Amp release"},new int[]{119,121,122},new int[]{127,127,127});
-        LinearLayout volume=row();TextView level=text("Volumen  "+gainDb+" dB",13,FG);volume.addView(level,new LinearLayout.LayoutParams(dp(135),-2));
-        SeekBar slider=new SeekBar(this);slider.setMax(24);slider.setProgress(gainDb+24);volume.addView(slider,new LinearLayout.LayoutParams(0,dp(44),1));
-        slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
-            public void onProgressChanged(SeekBar b,int value,boolean user){if(!user)return;gainDb=value-24;level.setText("Volumen  "+gainDb+" dB");prefs.edit().putInt("gain",gainDb).apply();try{if(nativeOk)RuntimeBridge.setGainDb(gainDb);}catch(RuntimeException|LinkageError e){message(e.getMessage());}}
-            public void onStartTrackingTouch(SeekBar b){}public void onStopTrackingTouch(SeekBar b){}
-        });content.addView(volume);content.addView(text("Los controles editan el sonido actual. Cambiar de patch recupera el sonido importado.",11,MUTED));
-        revision=-1;
-    }
-    private static final class Slider { final int index;final SeekBar bar;final TextView value;boolean known;Slider(int i,SeekBar b,TextView v){index=i;bar=b;value=v;} }
-    private void addSliderRow(LinearLayout content,String[] names,int[] indices,int[] max){
-        LinearLayout row=row();
-        for(int i=0;i<names.length;++i){final int index=indices[i];LinearLayout card=column();card.setPadding(dp(7),dp(5),dp(7),dp(3));card.setBackground(shape(PANEL,dp(4)));
-            LinearLayout label=row();label.addView(text(names[i],12,FG),new LinearLayout.LayoutParams(0,-2,1));TextView value=text("—",12,ORANGE);label.addView(value);card.addView(label);
-            SeekBar bar=new SeekBar(this);bar.setMax(max[i]);bar.setEnabled(false);card.addView(bar,new LinearLayout.LayoutParams(-1,dp(36)));Slider bind=new Slider(index,bar,value);sliders.add(bind);
-            bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
-                public void onProgressChanged(SeekBar b,int n,boolean user){if(!user||syncing||!ready||busy)return;try{RuntimeBridge.setParameter(index,n);value.setText(Integer.toString(n));message("Edición temporal del sonido actual");}catch(RuntimeException e){message(e.getMessage());}}
-                public void onStartTrackingTouch(SeekBar b){}public void onStopTrackingTouch(SeekBar b){}
-            });LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,-2,1);lp.setMargins(dp(2),dp(2),dp(2),dp(2));row.addView(card,lp);
-        }content.addView(row);
+        page=selected;romButton=bankButton=null;diagnostics=null;body.removeAllViews();
+        for(int i=0;i<navTabs.size();i++)SynthUi.styleButton(navTabs.get(i),BLUE,i==page);
+        ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);
+        if(page==0){
+            if(editor==null)editor=new XeniaEditor(this,new XeniaEditor.Listener(){
+                public boolean parameter(int index,int value){
+                    if(!ready||busy||patchPhase!=0||!currentKnown)return false;
+                    try{RuntimeBridge.setParameter(index,value);editorValues[index]=value;message("Edición temporal · "+XtParameters.get(index).name+" = "+value);return true;}
+                    catch(RuntimeException|LinkageError e){message(e.getMessage());return false;}
+                }
+                public void gain(int db){
+                    if(!nativeOk||busy)return;
+                    try{RuntimeBridge.setGainDb(db);gainDb=db;prefs.edit().putInt("gain",gainDb).apply();}
+                    catch(RuntimeException|LinkageError e){message(e.getMessage());}
+                }
+                public void testNote(boolean on){
+                    if(!ready||!nativeOk)return;
+                    try{if(on){if(!audio.isRunning()){message("Pulsá INICIAR para probar la nota C4.");return;}NativeBridge.nativeNoteOn(60,100);}
+                        else NativeBridge.nativeNoteOff(60);}
+                    catch(RuntimeException|LinkageError e){message(e.getMessage());}
+                }
+            });
+            if(editor.getParent()!=null)((android.view.ViewGroup)editor.getParent()).removeView(editor);
+            editor.bind(editorValues,gainDb);scroll.addView(editor,new ScrollView.LayoutParams(-1,-2));
+        }else{
+            LinearLayout content=column();content.setPadding(dp(6),dp(10),dp(6),dp(8));
+            if(page==1)buildBanks(content);else buildConfig(content);
+            scroll.addView(content,new ScrollView.LayoutParams(-1,-2));
+        }
+        body.addView(scroll,new FrameLayout.LayoutParams(-1,-1));refreshDisplay();controls();
     }
     private void buildBanks(LinearLayout content){
         LinearLayout top=row();bankButton=button("IMPORTAR .SYX / .MID",ORANGE,v->pick(PICK_BANK));top.addView(bankButton);top.addView(text("  "+library.slots().size()+" / 256 sonidos",13,FG));content.addView(top);
@@ -267,7 +263,7 @@ public final class MainActivity extends Activity {
             android.content.ClipboardManager clip=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
             if(clip!=null) {
                 clip.setPrimaryClip(android.content.ClipData.newPlainText("RiXenia diagnóstico",
-                    "RiXenia 0.1.2 · "+android.os.Build.MANUFACTURER+" "+android.os.Build.MODEL+
+                    "RiXenia 0.2.0 · "+android.os.Build.MANUFACTURER+" "+android.os.Build.MODEL+
                     " · Android "+android.os.Build.VERSION.RELEASE+"\n"+display.getText()+"\n"+
                     stats.getText()+"\n"+footer.getText()+"\n"+audio.diagnosticReport()));
                 message("Diagnóstico copiado. Podés pegarlo en el chat; no contiene ROM ni bancos.");
@@ -306,21 +302,15 @@ public final class MainActivity extends Activity {
             if(state[0]!=revision||previous!=patchPhase){
                 revision=state[0];
                 if(state[1]>=0&&state[1]<2&&state[2]>=0&&state[2]<128){
-                    bank=state[1];program=state[2];prefs.edit().putInt("bank",bank).putInt("program",program).apply();
+                    if(bank!=state[1]||program!=state[2]){bank=state[1];program=state[2];prefs.edit().putInt("bank",bank).putInt("program",program).apply();}
                 }
                 currentKnown=patchPhase==0;
                 for(int i=0;i<256;++i)if(state[3+i]<0){currentKnown=false;break;}
                 StringBuilder n=new StringBuilder();
                 if(currentKnown)for(int i=240;i<256;++i){int c=state[3+i];n.append(c>=32&&c<127?(char)c:' ');}
                 liveName=n.toString().trim();
-                syncing=true;
-                for(Slider slider:sliders){
-                    int value=state[3+slider.index];slider.known=currentKnown&&value>=0;
-                    slider.bar.setEnabled(slider.known&&!busy);
-                    if(slider.known&&!slider.bar.isPressed()){slider.bar.setProgress(value);slider.value.setText(Integer.toString(value));}
-                    else if(!slider.known)slider.value.setText("—");
-                }
-                syncing=false;
+                System.arraycopy(state,3,editorValues,0,256);
+                if(editor!=null)editor.bind(editorValues,gainDb);
             }
             if(patchPhase!=0&&audio.isRunning())message(String.format(Locale.ROOT,
                 "%s · %.1f s · cola MIDI %d / SysEx %d",patchPhase==3?"El firmware aún no confirmó el sonido":"Aplicando patch",state[261]/1000.0,queuedMidi,queuedSysex));
@@ -343,6 +333,9 @@ public final class MainActivity extends Activity {
     private LinearLayout row(){LinearLayout l=new LinearLayout(this);l.setOrientation(LinearLayout.HORIZONTAL);l.setGravity(Gravity.CENTER_VERTICAL);return l;}
     private TextView text(String value,int sp,int color){TextView v=new TextView(this);v.setText(value);v.setTextSize(sp);v.setTextColor(color);return v;}
     private GradientDrawable shape(int color,int radius){GradientDrawable d=new GradientDrawable();d.setColor(color);d.setCornerRadius(radius);return d;}
-    private Button button(String label,int color,View.OnClickListener listener){Button b=new Button(this);b.setText(label);b.setTextSize(11);b.setTextColor(color);b.setMinWidth(0);b.setMinimumWidth(0);b.setMinHeight(dp(36));b.setMinimumHeight(dp(36));b.setPadding(dp(8),0,dp(8),0);b.setAllCaps(false);if(listener!=null)b.setOnClickListener(listener);return b;}
-    private void addEngineButton(LinearLayout row,String label,View.OnClickListener listener){Button b=button(label,BLUE,listener);needsEngine.add(b);row.addView(b,new LinearLayout.LayoutParams(dp(74),dp(60)));}
+    private Button button(String label,int color,View.OnClickListener listener){return SynthUi.button(this,label,color,listener);}
+    private void addTransport(LinearLayout row,Button button){LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-2,dp(34));p.setMargins(dp(3),0,0,0);row.addView(button,p);}
+    private void addEngineButton(LinearLayout row,String label,View.OnClickListener listener){
+        Button b=button(label,BLUE,listener);needsEngine.add(b);LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(dp(69),dp(54));p.setMargins(dp(2),0,dp(2),0);row.addView(b,p);
+    }
 }

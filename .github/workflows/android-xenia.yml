@@ -19,7 +19,7 @@ env:
   RIXENIA_BUILD_DIR: ${{ github.workspace }}/build/android-xenia-release
 jobs:
   build-apk:
-    name: RiXenia 0.1.2 ARM64 V2
+    name: RiXenia 0.2.0 ARM64 V2
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -39,13 +39,14 @@ jobs:
           git submodule status --recursive >> artifacts/source-revision.txt
           git archive --format=zip HEAD source/Android/RiXeniaApp source/Android/rixeniaNative \
             source/Android/build-rixenia-native.sh source/Android/verify-rixenia.py source/waldi/common/wLib \
-            source/waldi/xt/xtLib source/CMakeLists.txt .github/workflows/android-xenia.yml > artifacts/RiXenia-0.1.2-android-source.zip
+            source/waldi/xt/xtLib source/CMakeLists.txt .github/workflows/android-xenia.yml > artifacts/RiXenia-0.2.0-android-source.zip
       - name: Parser, output sizing, dispatch, SRC and lifecycle tests
         run: |
           JAVA_SRC=source/Android/RiXeniaApp/app/src/main/java/com/rinoize/rixenia
           javac -encoding UTF-8 -d build/rixenia-tests "$JAVA_SRC/BankFile.java" "$JAVA_SRC/PatchLibrary.java" \
-            "$JAVA_SRC/AudioSizing.java" "$JAVA_SRC/RomFile.java" "$JAVA_SRC/RenderMeter.java" "$JAVA_SRC/AudioHealth.java" source/Android/RiXeniaApp/tests/*Test.java
-          for test in BankFileTest AudioSizingTest RomFileTest AudioHealthTest; do
+            "$JAVA_SRC/AudioSizing.java" "$JAVA_SRC/RomFile.java" "$JAVA_SRC/RenderMeter.java" "$JAVA_SRC/AudioHealth.java" "$JAVA_SRC/XtParameters.java" source/Android/RiXeniaApp/tests/*Test.java
+          python3 source/Android/RiXeniaApp/tests/check_editor_catalog.py | tee artifacts/editor-catalog.txt
+          for test in BankFileTest AudioSizingTest RomFileTest AudioHealthTest XtParametersTest; do
             java -cp build/rixenia-tests "$test" | tee "artifacts/$test.txt"
           done
           for test in source/Android/RiXeniaApp/tests/*Test.cpp; do
@@ -98,21 +99,26 @@ jobs:
         run: gradle --no-daemon --stacktrace :app:assembleRelease
       - name: Verify APK, signature and 16 KiB alignment
         run: |
-          APK=artifacts/RiXenia-0.1.2-arm64.apk
+          APK=artifacts/RiXenia-0.2.0-arm64.apk
           cp source/Android/RiXeniaApp/app/build/outputs/apk/release/app-release.apk "$APK"
           "${ANDROID_HOME}/build-tools/35.0.0/aapt" dump badging "$APK" > artifacts/apk-info.txt
           "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee artifacts/apk-signing.txt
           "${ANDROID_HOME}/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "$APK" > artifacts/apk-alignment.txt
           python3 source/Android/verify-rixenia.py apk "$APK" --badging artifacts/apk-info.txt --report artifacts/apk-verification.json
           cp source/Android/RiXeniaApp/README.md artifacts/README-RiXenia.md
-          echo '### RiXenia 0.1.2 ARM64 V2' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Updates RiXenia V2 0.1.1 in place; do not uninstall or clear app data.' >> "$GITHUB_STEP_SUMMARY"
+          echo '### RiXenia 0.2.0 ARM64 V2' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Updates RiXenia V2 0.1.2 in place; do not uninstall or clear app data.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Release build, host tests, signature and ELF alignment verified. Physical tablet validation pending.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Build UI-only emulator test APKs (no firmware or native ABI)
+        working-directory: source/Android/RiXeniaApp
+        run: gradle --no-daemon -PuiSmoke :app:assembleDebug :app:assembleDebugAndroidTest
+      - name: Android 35 touch and layout tests at tablet and compact densities
+        run: bash source/Android/RiXeniaApp/tests/run-ui-smoke.sh
       - name: Upload APK, Android sources and reports
         if: success() && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: RiXenia-0.1.2-arm64
+          name: RiXenia-0.2.0-arm64
           path: artifacts/
           retention-days: 90
           if-no-files-found: error
@@ -120,7 +126,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: RiXenia-0.1.2-build-diagnostics
+          name: RiXenia-0.2.0-build-diagnostics
           path: artifacts/
           retention-days: 90
           if-no-files-found: warn
