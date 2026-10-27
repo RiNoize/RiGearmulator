@@ -1,45 +1,43 @@
-# RiXenia Android 0.1.1 alpha
+# RiXenia Android 0.1.2 alpha
 
-Aplicación independiente para tocar el motor **Xenia / Waldorf Microwave II–XT** de Gearmulator en Android ARM64. Identificador V2 `com.rinoize.rixenia.v2`: puede instalarse junto a RiGear / Osirus y RiXenia 0.1.0. Usa el motor original `xtLib`, con un DSP y sin expansión de voces.
+Aplicación independiente ARM64 para el motor Xenia / Waldorf Microwave II–XT de Gearmulator. Usa xtLib, un DSP, reloj 100%, sin expansión de voces.
 
-## Instalación sin perder la versión anterior
+## Actualización
 
-Instalá `RiXenia-0.1.1-arm64.apk`: aparece como **RiXenia V2**. La firma anterior fue reemplazada por la V2 utilizada en RiGear. Por eso no se intenta actualizar la app 0.1.0 con un certificado diferente: **no desinstales la anterior**. En V2 necesitás importar una vez tu ROM y tus bancos; no se leen automáticamente los datos privados de la app anterior. Las futuras actualizaciones V2 mantienen sus datos.
+Instalar `RiXenia-0.1.2-arm64.apk` sobre **RiXenia V2 0.1.1**, sin desinstalar ni borrar datos. Mantiene `com.rinoize.rixenia.v2`, el certificado V2, la ROM y los bancos importados. La app original 0.1.0 sigue siendo independiente.
 
-En CONFIGURACIÓN → CARGAR ROM BIN / ZIP, seleccioná tu ROM completa de 262144 bytes o el ZIP con las dos mitades de 128 KiB. Se combinan automáticamente. El update MIDI incluido no se aplica; se usa el sistema de la ROM BIN. La ROM queda guardada internamente.
+## Cambios 0.1.2
 
-En BANCOS → IMPORTAR .SYX / .MID importá tus sonidos Single. A/B admite 128 sonidos por banco. Una nueva importación reemplaza las posiciones coincidentes; los recursos wave y wavetable también se conservan. Los mensajes Multi, Global, Mode y de otros modelos se omiten. Los bancos ZIP todavía necesitan descomprimirse.
+Se evitan el mutex y la notificación de reanudación cuando el DSP ya corre, y el bloqueo por muestra cuando no hay una orden de halt. No se repite la señal de inicio de audio en cada frame activo. Se conserva el despertar bajo mutex al iniciar cada bloque, las notificaciones entre bloques y los predicados de halt/cierre. No se cambia el reloj DSP, la polifonía ni el firmware, ni se suspende el motor al detectar silencio.
 
-Para comparar con las pruebas anteriores de la Galaxy Tab A9, seleccioná **buffer motor 1024, salida 48000 Hz y modo Conservador**. Pulsá INICIAR. La ROM 2.33 permite probar un sonido inicial con NOTA C4. Conectá el teclado USB desde CONFIGURACIÓN; probá primero con canal 1.
+CONFIGURACIÓN incorpora **COPIAR DIAGNÓSTICO**. Guarda hasta 32 grupos de eventos: intervalo de observación, incremento y total de underruns, buffer antes/después y capacidad, cola aproximada, pico y media de render de esa ventana, OV y CPU app. El monitor consulta nominalmente cada 500 ms; los intervalos reales pueden ser mayores. El registro no indica el instante exacto de cada underrun ni prueba su causa. El pico incluye sólo bloques terminados en la ventana. El formato y el historial se elaboran fuera del hilo de render, sin firmware ni dumps de patches.
 
-## Corrección de cambios de patch
+La pantalla muestra el pico reciente y el tiempo sin nuevos underruns observados. No se ocultan ni reinician los contadores acumulativos. El historial está acotado. La política AUTO no cambia: sólo aumenta al observar nuevos underruns; su capacidad depende del tamaño solicitado, como antes.
 
-- Se alternan los lotes MIDI y de control: notas, CC o Clock continuos no postergan indefinidamente el SysEx del patch. Se mantiene la separación entre dumps completos para no saturar el firmware.
-- Entrar en modo Single no se repite en cada selección. Las selecciones rápidas sustituyen los dumps de edit buffer todavía pendientes; no se descartan notas ni mensajes del pedal.
-- El display distingue CARGANDO, PENDIENTE · INICIAR y SIN CONFIRMAR. La confirmación requiere una respuesta real del firmware con los 256 bytes del sonido solicitado, no la caché optimista del editor.
-- Se informa el tiempo de confirmación y la cola MIDI/SysEx. Ese tiempo no es la latencia audible: puede haber audio previamente generado en el buffer de salida.
-- A los tres segundos sin confirmación se informa, pero se aceptan respuestas tardías y nuevas selecciones. La edición de parámetros queda deshabilitada mientras se aplica el patch.
+Se agregan opciones de salida 2304 y 3072 frames sin reinterpretar las preferencias anteriores; 4096 conserva su valor. Para comparar con la sesión reportada: **motor 512, 48000 Hz, Baja latencia + AUTO, salida solicitada 2304**. Es el tamaño efectivo alcanzado por la sesión anterior. No es una promesa de latencia total de 48 ms ni una configuración universal. Si funciona estable, otra prueba separada puede reducirlo.
 
-Los recursos wave/wavetable mantienen su orden. Una restauración grande todavía puede tardar; no se omiten dependencias para aparentar un cambio instantáneo.
+## ROM y biblioteca
 
-## Audio e interfaz
+CONFIGURACIÓN → CARGAR ROM BIN / ZIP acepta una ROM completa de 262144 bytes o un ZIP con dos mitades de 128 KiB que se combinan automáticamente. Debe incluir las waves. Un update MIDI solo no alcanza y no se aplica si está en el ZIP. La ROM se guarda internamente.
 
-El motor funciona a 40000 Hz. La salida de 48000 Hz usa conversión continua 6/5. Nativa solicita 40000 Hz a Android, sin garantizar que sea la frecuencia física de salida.
+BANCOS → IMPORTAR .SYX / .MID importa Singles Microwave II/XT y sus recursos wave/wavetable. Los ZIP de bancos requieren descomprimirse. A/B contiene 128 posiciones por banco; nuevas importaciones reemplazan direcciones coincidentes. Los bancos y la selección quedan guardados sin necesitar el pendrive. No se extrae una biblioteca de fábrica desde la ROM. Los mensajes Multi/Global/Mode y otros modelos se omiten.
 
-Se mantienen sustain, modulación, pitch bend y PANIC, los nueve controles de síntesis y volumen de −24 a 0 dB. Las ediciones son temporales. La pantalla permanece encendida y admite ambas posiciones horizontales. Al salir se detiene el audio; al volver o importar archivos, pulsá INICIAR. ROM, bancos y selección permanecen guardados.
+## Audio, MIDI y patch
 
-Render mide tiempo por bloque, no CPU pura. OV es acumulativo y OV/s indica bloques tardíos por segundo. CPU app suma el tiempo de los hilos; 100% equivale a un núcleo. Underruns informa vaciados de AudioTrack. Conservador da margen a costa de latencia. Los diagnósticos se recogen fuera del render.
+Motor interno a 40000 Hz; 48000 Hz usa conversión continua 6/5. Nativa pide 40000 Hz a Android sin garantizar que sea la frecuencia física. Se mantienen sustain, modulación, pitch bend y PANIC, nueve controles temporales de síntesis y volumen de -24 a 0 dB. No se guardan ediciones de patch.
+
+Se conservan las correcciones 0.1.1: reparto entre MIDI y control sin postergar indefinidamente patches, no repetir modo Single, última selección pendiente vigente y confirmación de los 256 parámetros por respuesta real del firmware, no por caché del editor. El tiempo de confirmación no equivale a latencia audible. Una transferencia grande de waves/tablas aún puede tardar; no se saltan dependencias.
+
+La pantalla permanece encendida y permite ambas orientaciones horizontales. Salir de la app detiene el audio; al volver, pulsar INICIAR. Render mide tiempo por bloque, CPU app suma los hilos (100% equivale a un núcleo), OV/s cuenta bloques fuera de plazo y underruns informa vaciados de AudioTrack.
 
 ## Verificación y límites
 
-Las pruebas automáticas cubren parsers, checksums, tamaños, conversión de frecuencia, ciclo de vida y planificación MIDI. La regresión nueva verifica tráfico continuo, buffers 256/512/1024, última selección vigente, buffers PMR del motor, rechazo de respuestas antiguas y confirmación tardía.
+CI verifica parsers, tamaños, SRC, despachador MIDI, ciclo de vida y el nuevo diagnóstico: conservación de totales, grupos de underruns, intervalos y límite de historial. Las pruebas de cierre incluyen reanudación sin halt y despertar de un DSP detenido.
 
-Las pruebas con ROM 2.33 documentadas para 0.1.0 no sustituyen la validación de esta revisión. No se afirma una reducción medida de CPU ni una latencia concreta en la tablet. La aceptación requiere cambiar sonidos con MIDI conectado, con y sin Clock, comprobando audio, confirmación, sustain y underruns.
+El motor y el puente JNI se ensayaron en Linux x86_64 con ROM 2.33 del usuario: audio finito y audible, confirmaciones reales bajo Clock/CC, buffers 256/512/1024, 40/48 kHz, sustain/PANIC, reanudación y cierre. Esas pruebas no reproducen AudioTrack ni la carga de la Galaxy Tab A9. No se afirma que esta revisión elimine todos los underruns ni un ahorro concreto de CPU en Android. Se requiere una prueba prolongada en la tablet, conservando el informe antes de reiniciar la sesión.
 
-No se incluye firmware ni bancos protegidos. Los artefactos contienen los cambios Android y las revisiones de los submódulos; el repositorio permite obtener las fuentes completas.
+No se incluyen firmware ni bancos protegidos. Código y modificaciones bajo las licencias del repositorio.
 
 ## Compilación
 
-Ejecutar `bash source/Android/build-rixenia-native.sh` con SDK/NDK instalado. Luego, desde `source/Android/RiXeniaApp`, ejecutar `gradle --no-daemon :app:assembleRelease`. GitHub Actions exige `RIGEAR_SIGNING_KEY_BASE64_V2` y comprueba su certificado, sin guardar claves privadas en caché ni generar firmas aleatorias para versiones distribuidas. El versionCode es creciente.
-
-Código y modificaciones bajo las condiciones de licencia del repositorio.
+Con SDK/NDK: `bash source/Android/build-rixenia-native.sh`; después, en `source/Android/RiXeniaApp`, `gradle --no-daemon :app:assembleRelease`. CI exige el secreto permanente `RIGEAR_SIGNING_KEY_BASE64_V2`, valida el certificado del APK final y su alineación de 16 KiB. No almacena claves privadas en caché ni inventa claves nuevas para actualizaciones. VersionCode creciente. Los artefactos contienen fuentes Android y revisiones de submódulos; el repositorio y sus submódulos contienen el resto de las fuentes.

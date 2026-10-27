@@ -30,9 +30,14 @@ namespace wLib
 
 	void Hardware::resumeDSP()
 	{
+		// The UC is the sole writer requesting a halt. Shutdown first sets
+		// m_terminateUcThread, which prevents subsequent halt requests.
+		// Avoid a mutex and a wake when the DSP is already running.
+		if(!m_haltDSP.load(std::memory_order_acquire))
+			return;
 		{
 			std::lock_guard uLockHalt(m_haltDSPmutex);
-			m_haltDSP = false;
+			m_haltDSP.store(false, std::memory_order_release);
 		}
 		m_haltDSPcv.notify_one();
 	}
@@ -121,7 +126,11 @@ namespace wLib
 			m_esaiFrameAddedCv.notify_one();
 		}
 
-		m_processAudioCv.notify_all();
+		// beginProcessAudio() already publishes under the wait mutex and wakes
+		// idle UC waiters. Do not repeat that wake for every active audio frame.
+		// Retain idle notifications: a DSP tail can still resolve the UC predicate.
+		if(!m_processAudio.load(std::memory_order_acquire))
+			m_processAudioCv.notify_all();
 
 		m_requestedFramesAvailableMutex.lock();
 
@@ -135,8 +144,13 @@ namespace wLib
 			m_requestedFramesAvailableMutex.unlock();
 		}
 
-		std::unique_lock uLock(m_haltDSPmutex);
-		m_haltDSPcv.wait(uLock, [&]{ return m_haltDSP == false; });
+		// Fast path for the normal, unhalted case. A real halt still uses the
+		// original mutex/predicate protocol, including shutdown wakeups.
+		if(m_haltDSP.load(std::memory_order_acquire))
+		{
+			std::unique_lock uLock(m_haltDSPmutex);
+			m_haltDSPcv.wait(uLock, [&]{ return m_haltDSP == false; });
+		}
 	}
 
 	void Hardware::syncUcToDSP()

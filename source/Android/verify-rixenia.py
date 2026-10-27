@@ -34,7 +34,7 @@ def elf_alignment(data, name):
     alignments = []
     for i in range(phnum):
         offset = phoff + phentsize * i
-        if struct.unpack_from("<I", data, offset)[0] != 1:  # PT_LOAD
+        if struct.unpack_from("<I", data, offset)[0] != 1:
             continue
         file_offset, virtual_address = struct.unpack_from("<QQ", data, offset + 8)
         alignment = struct.unpack_from("<Q", data, offset + 48)[0]
@@ -48,7 +48,7 @@ def elf_alignment(data, name):
 def apk(path, badging):
     info = Path(badging).read_text()
     assert "package: name='com.rinoize.rixenia.v2'" in info
-    assert "versionName='0.1.1'" in info
+    assert "versionName='0.1.2'" in info
     version_code = int(re.search(r"versionCode='(\d+)'", info).group(1))
     assert version_code >= 1
     assert "application-debuggable" not in info, "APK must not be debuggable"
@@ -67,7 +67,7 @@ def apk(path, badging):
             assert name in names, name + ": missing from APK"
             libraries[name] = elf_alignment(package.read(name), name)
         assert not any(name.startswith("lib/") and name.split("/")[1] != "arm64-v8a" for name in names)
-    return {"applicationId": "com.rinoize.rixenia.v2", "versionName": "0.1.1",
+    return {"applicationId": "com.rinoize.rixenia.v2", "versionName": "0.1.2",
             "versionCode": version_code, "debuggable": False, "signingCertificateSha256": certificate, "elfLoadAlignments": libraries}
 
 

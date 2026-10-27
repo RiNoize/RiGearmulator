@@ -23,6 +23,11 @@ public:
     std::unique_lock<std::mutex> gateAudio() { return std::unique_lock<std::mutex>(m_processAudioMutex); }
     std::unique_lock<std::mutex> gateSync() { return std::unique_lock<std::mutex>(m_esaiFrameAddedMutex); }
     bool halted() const { return m_haltDSP.load(); }
+    std::unique_lock<std::mutex> gateHalt() { return std::unique_lock<std::mutex>(m_haltDSPmutex); }
+    void waitForResume() {
+        std::unique_lock lock(m_haltDSPmutex);
+        m_haltDSPcv.wait(lock, [&] { return !m_haltDSP.load(); });
+    }
 
     // If the production termination path regresses, release every waiter before
     // destroying its fixture. A frame advance also rescues the old sync predicate.
@@ -52,6 +57,7 @@ public:
         });
     }
     ~Task() { if (worker.joinable()) worker.join(); }
+    bool ready() { return done.wait_for(500ms) == std::future_status::ready; }
     bool await(TestHardware& hardware, const char* label) {
         const bool timely = done.wait_for(1500ms) == std::future_status::ready;
         if (!timely) {
@@ -135,6 +141,23 @@ bool terminateSynchronizedUc() {
     return terminated && woke;
 }
 
+bool alreadyRunningFastPath() {
+    TestHardware hardware;
+    auto gate = hardware.gateHalt();
+    Task resume([&] { hardware.resumeDSP(); });
+    const bool nonBlocking = resume.ready();
+    gate.unlock();
+    return resume.await(hardware, "already-running resume") && nonBlocking;
+}
+
+bool resumeActualHalt() {
+    TestHardware hardware;
+    hardware.haltDSP();
+    Task dsp([&] { hardware.waitForResume(); });
+    hardware.resumeDSP();
+    return dsp.await(hardware, "halted DSP resume") && !hardware.halted();
+}
+
 bool terminationBeforeWaiting() {
     TestHardware hardware;
     hardware.haltDSP();
@@ -156,9 +179,9 @@ int main() {
     // Repeat the contested transitions to exercise either mutex acquisition order.
     for (int i = 0; i < 32 && passed; ++i)
         passed = resumeIdleAudio() && terminateIdleUc() && terminateSynchronizedUc();
-    passed = terminationBeforeWaiting() && passed;
+    passed = terminationBeforeWaiting() && alreadyRunningFastPath() && resumeActualHalt() && passed;
     if (!passed) return EXIT_FAILURE;
     std::cout << "Waldorf lifecycle: idle resume, idle termination, synchronization termination, "
-                 "and halted-DSP shutdown passed\n";
+                 "halted-DSP shutdown, no-op resume fast path and actual-halt wake passed\n";
     return EXIT_SUCCESS;
 }

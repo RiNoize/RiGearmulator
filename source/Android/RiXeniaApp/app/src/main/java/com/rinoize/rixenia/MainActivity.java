@@ -28,7 +28,7 @@ public final class MainActivity extends Activity {
     private static volatile boolean engineUnsafe;
     private static final int PICK_ROM=201,PICK_BANK=202;
     private static final int BG=0xff11151b,PANEL=0xff202731,FG=0xffeaf1f7,MUTED=0xffa9b9c8,ORANGE=0xffff9b3f,BLUE=0xff77caff;
-    private static final int[] BLOCKS={256,512,1024},RATES={48000,0},OUTPUTS={512,768,1024,1536,2048,4096};
+    private static final int[] BLOCKS={256,512,1024},RATES={48000,0},OUTPUTS={512,768,1024,1536,2048,2304,3072,4096};
     private final Handler ui=new Handler(Looper.getMainLooper());
     private final RealtimeAudio audio=new RealtimeAudio();
     private final MeterWindow renderWindow=new MeterWindow();
@@ -61,6 +61,11 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         prefs=getSharedPreferences("rixenia-v1",MODE_PRIVATE);
+        // Preserve the old 4096-frame choice: new entries must not reinterpret index 5.
+        if(!prefs.getBoolean("output-options-012",false)) {
+            int old=prefs.getInt("output",2);
+            prefs.edit().putInt("output",old==5?7:old).putBoolean("output-options-012",true).apply();
+        }
         bank=Math.max(0,Math.min(1,prefs.getInt("bank",0)));program=Math.max(0,Math.min(127,prefs.getInt("program",0)));
         gainDb=Math.max(-24,Math.min(0,prefs.getInt("gain",-6)));
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -68,7 +73,7 @@ public final class MainActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN|View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
         LinearLayout root=column();root.setBackgroundColor(BG);root.setPadding(dp(10),dp(6),dp(10),dp(5));
         LinearLayout header=row();TextView title=text("RiXenia",22,ORANGE);title.setTypeface(Typeface.DEFAULT,Typeface.BOLD);header.addView(title);
-        TextView sub=text("  Microwave II / XT  ·  0.1.1 α",12,MUTED);header.addView(sub,new LinearLayout.LayoutParams(0,-2,1));
+        TextView sub=text("  Microwave II / XT  ·  0.1.2 α",12,MUTED);header.addView(sub,new LinearLayout.LayoutParams(0,-2,1));
         play=button("▶ INICIAR",ORANGE,v->startAudio());stop=button("■ DETENER",BLUE,v->stopAudio());
         header.addView(play);header.addView(stop);header.addView(button("PANIC",0xffff7787,v->panic()));root.addView(header);
         stats=text("Motor detenido",11,MUTED);root.addView(stats);
@@ -253,11 +258,21 @@ public final class MainActivity extends Activity {
         LinearLayout config=row();blockChoice=setting(config,"Buffer motor",new String[]{"256","512","1024"},"block",1);
         rateChoice=setting(config,"Salida",new String[]{"48000 Hz","Nativa 40000 Hz"},"rate",0);
         modeChoice=setting(config,"Modo",new String[]{"Conservador","Baja latencia + AUTO"},"mode",0);
-        outputChoice=setting(config,"Buffer salida",new String[]{"512","768","1024","1536","2048","4096"},"output",2);content.addView(config);
+        outputChoice=setting(config,"Buffer salida",new String[]{"512","768","1024","1536","2048","2304","3072","4096"},"output",2);content.addView(config);
         content.addView(text("Los cambios de audio se aplican al detener e iniciar. 512 / 48000 Hz / Conservador es el punto de partida. Motor a 100% y expansión de voces desactivada.",11,MUTED));
         LinearLayout connection=row();midiChoice=new Spinner(this);connection.addView(midiChoice,new LinearLayout.LayoutParams(0,dp(44),1));
         connection.addView(button("CONECTAR MIDI",BLUE,v->{if(ports.isEmpty()){message("No hay puertos MIDI disponibles");return;}try{midi.connect(ports.get(Math.max(0,midiChoice.getSelectedItemPosition())));}catch(RuntimeException e){message(e.getMessage());}}));
         connection.addView(button("DESCONECTAR",BLUE,v->midi.disconnect()));content.addView(connection);refreshPorts();
+        content.addView(button("COPIAR DIAGNÓSTICO",BLUE,v->{
+            android.content.ClipboardManager clip=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+            if(clip!=null) {
+                clip.setPrimaryClip(android.content.ClipData.newPlainText("RiXenia diagnóstico",
+                    "RiXenia 0.1.2 · "+android.os.Build.MANUFACTURER+" "+android.os.Build.MODEL+
+                    " · Android "+android.os.Build.VERSION.RELEASE+"\n"+display.getText()+"\n"+
+                    stats.getText()+"\n"+footer.getText()+"\n"+audio.diagnosticReport()));
+                message("Diagnóstico copiado. Podés pegarlo en el chat; no contiene ROM ni bancos.");
+            }
+        }));
         diagnostics=text("",12,MUTED);content.addView(diagnostics);content.addView(text("La pantalla permanece encendida. Al salir de RiXenia se detiene el audio; ambas posiciones horizontales están habilitadas.",11,MUTED));
     }
     private Spinner setting(LinearLayout parent,String label,String[] choices,String key,int fallback){
@@ -275,7 +290,7 @@ public final class MainActivity extends Activity {
             if(session!=null&&audio.isRunning()){
                 long[] totals=session.meter.snapshot();double[] window=renderWindow.sample(System.nanoTime(),totals,session.deviceSampleRate);
                 stats.setText(String.format(Locale.ROOT,"Render %.1f%%  ·  CPU app %.1f%%  ·  OV %d · %.1f OV/s  ·  underruns %d  ·  %d → %d Hz",window[0],appCpu,totals[4],window[1],session.underruns,session.deviceSampleRate,session.sampleRate));
-                if(diagnostics!=null){RealtimeAudio.OutputState s=session.output;diagnostics.setText(session.configuration+"\nSalida: "+s.effectiveFrames+" frames / capacidad "+s.capacityFrames+" · "+RealtimeAudio.performanceName(s.performanceMode)+"\n"+s.route+(session.monitorNote.isEmpty()?"":"\n"+session.monitorNote));}
+                if(diagnostics!=null){RealtimeAudio.OutputState s=session.output;diagnostics.setText(session.configuration+"\nSalida: "+s.effectiveFrames+" frames / capacidad "+s.capacityFrames+" · "+RealtimeAudio.performanceName(s.performanceMode)+"\n"+s.route+(session.monitorNote.isEmpty()?"":"\n"+session.monitorNote)+"\n"+audio.healthSummary());}
             }else stats.setText(String.format(Locale.ROOT,"%s  ·  CPU app %.1f%%",busy?"Preparando motor…":"Motor detenido",appCpu));
             if(session!=null&&!session.error.isEmpty()&&!session.error.equals(lastError)){lastError=session.error;message(session.error);midiGate=false;}
             refreshPatchState();

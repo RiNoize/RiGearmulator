@@ -6,6 +6,7 @@ import android.media.AudioFormat;
 import android.media.AudioTrack;
 import android.os.Build;
 import android.os.Process;
+import android.os.SystemClock;
 
 /** 0.11.1 stability update: optional C++ conversion to 48000 Hz; native-rate path retained.
  * Engine frame counts and deadlines use deviceSampleRate. Playback uses sampleRate.
@@ -42,6 +43,9 @@ public final class RealtimeAudio {
         public final RenderMeter meter = new RenderMeter();
         private final AudioTrack track;
         private final PlaybackQueueMeter queueMeter = new PlaybackQueueMeter();
+        private final AudioHealth health;
+        private final long[] renderWindow = new long[4];
+        private long lastCpuMs, lastCpuWallMs;
         private Thread worker, monitor;
         public volatile boolean stopRequested, monitorStop, playing, finished;
         public volatile int underruns, adaptiveChanges, adaptiveFrames;
@@ -58,6 +62,7 @@ public final class RealtimeAudio {
             maxOutputFrames = AudioSizing.maxOutputFrames(frames, nativeRate, outputRate);
             configuration = config; outputMode = mode;
             requestedOutputFrames = requested; extraDspFrames = extra;
+            health = new AudioHealth(frames, nativeRate, outputRate, requested);
             adaptiveFrames = track.getBufferSizeInFrames();
             output = new OutputState(track.getBufferSizeInFrames(), track.getBufferCapacityInFrames(),
                     track.getPerformanceMode(), threshold(track), -1, 0, 0, "Sin ruta activa");
@@ -127,6 +132,15 @@ public final class RealtimeAudio {
         } catch (RuntimeException error) { track.release(); throw error; }
     }
 
+    public String healthSummary() {
+        Session s = current; return s == null ? "Sin sesión de audio" : s.health.summary();
+    }
+
+    public String diagnosticReport() {
+        Session s = current; return s == null ? "Sin sesión de audio" :
+                s.configuration + "\n" + s.output.route + "\n" + s.health.report();
+    }
+
     private static int threshold(AudioTrack track) {
         return Build.VERSION.SDK_INT >= 31 ? track.getStartThresholdInFrames() : -1;
     }
@@ -137,11 +151,12 @@ public final class RealtimeAudio {
         try {
             int observedUnderruns = s.track.getUnderrunCount();
             long now = System.nanoTime();
+            int beforeFrames = s.track.getBufferSizeInFrames();
             if (s.outputMode == LOW_LATENCY && s.playing
                     && now - s.playbackStartedNanos >= ADAPTIVE_GRACE_NANOS
                     && observedUnderruns > s.lastObservedUnderruns
                     && now - s.lastAdaptiveNanos >= ADAPTIVE_MIN_INTERVAL_NANOS) {
-                int currentFrames = s.track.getBufferSizeInFrames();
+                int currentFrames = beforeFrames;
                 int capacityFrames = s.track.getBufferCapacityInFrames();
                 int targetFrames = PlaybackQueueMeter.nextAdaptiveBufferSize(
                         currentFrames, capacityFrames, ADAPTIVE_QUANTUM_FRAMES);
@@ -172,6 +187,13 @@ public final class RealtimeAudio {
                     s.track.getPerformanceMode(), threshold(s.track), pending,
                     s.queueMeter.writtenFrames(), now, route);
             s.underruns = observedUnderruns;
+            long wallMs = SystemClock.elapsedRealtime(), cpuMs = Process.getElapsedCpuTime();
+            double cpu = wallMs > s.lastCpuWallMs ?
+                    100.0 * (cpuMs - s.lastCpuMs) / (wallMs - s.lastCpuWallMs) : 0;
+            s.lastCpuMs = cpuMs; s.lastCpuWallMs = wallMs;
+            s.meter.drainWindow(s.renderWindow);
+            s.health.observe(now, observedUnderruns, beforeFrames, effective,
+                    s.output.capacityFrames, pending, s.renderWindow, cpu);
             if (s.resampling) {
                 long[] stats = RuntimeBridge.conversionStats();
                 if (stats != null && stats.length == 4) {
@@ -231,6 +253,9 @@ public final class RealtimeAudio {
             s.meter.reset(); s.track.play(); s.playing = true;
             s.playbackStartedNanos = System.nanoTime();
             s.lastObservedUnderruns = s.track.getUnderrunCount();
+            s.health.start(s.playbackStartedNanos);
+            s.lastCpuMs = Process.getElapsedCpuTime();
+            s.lastCpuWallMs = SystemClock.elapsedRealtime();
             startMonitor(s);
 
             while (!s.stopRequested) {
