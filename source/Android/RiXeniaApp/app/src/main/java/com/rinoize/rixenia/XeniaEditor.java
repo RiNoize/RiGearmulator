@@ -103,9 +103,10 @@ public final class XeniaEditor extends LinearLayout {
     private boolean inside(View v,View parent){for(android.view.ViewParent p=v.getParent();p!=null;p=p.getParent())if(p==parent)return true;return false;}
     private void buildFilter(){
         removeBindings(filterCard);LinearLayout head=heading(filterCard,"⊣  FILTROS");
+        head.getLayoutParams().height=dp(32);
+        selector(head,filter==0?64:74,"",filter==0?XtParameters.FILTER1:XtParameters.FILTER2,1.7f);
         Button b1=small("F1",filter==0,()->{filter=0;buildFilter();refresh();});Button b2=small("F2",filter==1,()->{filter=1;buildFilter();refresh();});
-        head.addView(b1,new LayoutParams(dp(36),-1));head.addView(b2,new LayoutParams(dp(36),-1));
-        LinearLayout select=SynthUi.row(getContext());selector(select,filter==0?64:74,"Tipo",filter==0?XtParameters.FILTER1:XtParameters.FILTER2,1);filterCard.addView(select);
+        head.addView(b1,new LayoutParams(dp(32),-1));head.addView(b2,new LayoutParams(dp(32),-1));
         LinearLayout row=SynthUi.row(getContext());filterCard.addView(row,new LayoutParams(-1,0,1));
         if(filter==0){knob(row,62,"Cutoff");knob(row,63,"Resonancia");knob(row,65,"Key Track");}
         else{knob(row,73,"Cutoff F2");knob(row,75,"Key Track F2");}

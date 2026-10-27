@@ -31,6 +31,8 @@ test "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1
 adb shell settings put global window_animation_scale 0
 adb shell settings put global transition_animation_scale 0
 adb shell settings put global animator_duration_scale 0
+# Suppress the emulator's first-use full-screen tutorial, not any app dialog.
+adb shell settings put secure immersive_mode_confirmations confirmed
 adb shell input keyevent 82
 adb shell wm size 800x1340
 APP=source/Android/RiXeniaApp/app/build/outputs/apk
