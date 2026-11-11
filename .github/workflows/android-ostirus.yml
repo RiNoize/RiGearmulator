@@ -1,0 +1,123 @@
+name: RiOsTIrus Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [android-ostirus]
+    paths: ['.github/workflows/android-ostirus.yml', 'CMakeLists.txt', 'source/**', '.gitmodules']
+  pull_request:
+    paths: ['.github/workflows/android-ostirus.yml', 'source/Android/**', 'source/axel/**', 'source/framework/**', 'source/cpu/**', 'source/CMakeLists.txt']
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+concurrency:
+  group: riostirus-apk-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  RIOSTIRUS_NDK_VERSION: '27.2.12479018'
+  RIOSTIRUS_BUILD_DIR: ${{ github.workspace }}/build/android-ostirus-release
+jobs:
+  build-apk:
+    name: RiOsTIrus 0.1.0 ARM64
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Fetch pinned emulator cores
+        run: git submodule update --init --recursive --depth 1 source/cpu/dsp56300 source/cpu/mc68k
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Source revision
+        run: |
+          mkdir -p artifacts build/riostirus-tests
+          git rev-parse HEAD > artifacts/source-revision.txt
+          git submodule status --recursive >> artifacts/source-revision.txt
+      - name: Host tests (MIDI parser, CPU placement)
+        run: |
+          for test in source/Android/RiOsTIrusApp/tests/*Test.cpp source/Android/RiXeniaApp/tests/ThreadPlacementTest.cpp; do
+            name="$(basename "$test" .cpp)"
+            clang++ -std=c++17 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined -pthread \
+              -I source/Android/riostirusNative -I source/Android/common "$test" -o "build/riostirus-tests/$name"
+            "build/riostirus-tests/$name" | tee "artifacts/$name.txt"
+          done
+      - name: Require V2 signing identity; never cache the private key
+        env:
+          RIGEAR_SIGNING_KEY_BASE64_V2: ${{ github.event_name != 'pull_request' && secrets.RIGEAR_SIGNING_KEY_BASE64_V2 || '' }}
+        run: |
+          mkdir -p "$HOME/.android"
+          if [ "${{ github.event_name }}" = 'pull_request' ]; then
+            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 3072 -validity 365 -dname 'CN=RiOsTIrus CI Only, O=RiNoize, C=AR'
+            echo 'Signing source: ephemeral PR test key, not a distributable update' > artifacts/signing-source.txt
+          else
+            test -n "$RIGEAR_SIGNING_KEY_BASE64_V2" || { echo 'Missing RIGEAR_SIGNING_KEY_BASE64_V2; no random replacement key permitted.' >&2; exit 1; }
+            printf '%s' "$RIGEAR_SIGNING_KEY_BASE64_V2" | base64 --decode > "$HOME/.android/debug.keystore"
+            ACTUAL_CERT="$(keytool -exportcert -alias androiddebugkey -keystore "$HOME/.android/debug.keystore" -storepass android | openssl dgst -sha256 | awk '{print $2}')"
+            test "$ACTUAL_CERT" = '30393306ce2796ea0effb1f199c0916c0cf7d2f2e88507c5a329e2f0f3e32775'
+            echo 'Signing source: permanent repository secret V2' > artifacts/signing-source.txt
+          fi
+          chmod 600 "$HOME/.android/debug.keystore"
+      - name: Android SDK and Java API verification
+        run: |
+          SDKMANAGER="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platforms;android-35' 'build-tools;35.0.0' 'cmake;3.22.1' "ndk;${RIOSTIRUS_NDK_VERSION}"
+          mkdir -p build/riostirus-java-api-check
+          javac -encoding UTF-8 -source 17 -target 17 -cp "${ANDROID_HOME}/platforms/android-35/android.jar" \
+            -d build/riostirus-java-api-check source/Android/RiOsTIrusApp/app/src/main/java/com/rinoize/riostirus/*.java
+      - name: Optimized ARM64 OsTIrus engine
+        run: |
+          bash source/Android/build-riostirus-native.sh
+          CACHE="${RIOSTIRUS_BUILD_DIR}/CMakeCache.txt"
+          grep -q 'CMAKE_BUILD_TYPE:STRING=Release' "$CACHE"
+          python3 - "${RIOSTIRUS_BUILD_DIR}/compile_commands.json" <<'EOF' | tee artifacts/native-build.txt
+          import json, sys
+          commands = json.load(open(sys.argv[1]))
+          for suffix in ("virusLib/device.cpp", "dsp56kEmu/dsp.cpp", "riostirusNative/RiOsTIrusNative.cpp"):
+              entry = next(c for c in commands if c["file"].endswith(suffix))
+              command = entry.get("command", " ".join(entry.get("arguments", [])))
+              assert "-DNDEBUG" in command and "-O0" not in command, suffix
+              print("Release flags OK:", suffix)
+          EOF
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Package RiOsTIrus APK
+        working-directory: source/Android/RiOsTIrusApp
+        run: gradle --no-daemon --stacktrace :app:assembleRelease
+      - name: Verify APK, signature and 16 KiB alignment
+        run: |
+          APK=artifacts/RiOsTIrus-0.1.0-arm64.apk
+          cp source/Android/RiOsTIrusApp/app/build/outputs/apk/release/app-release.apk "$APK"
+          "${ANDROID_HOME}/build-tools/35.0.0/aapt" dump badging "$APK" > artifacts/apk-info.txt
+          grep -q "package: name='com.rinoize.riostirus'" artifacts/apk-info.txt
+          grep -q "versionName='0.1.0'" artifacts/apk-info.txt
+          grep -q "native-code: 'arm64-v8a'" artifacts/apk-info.txt
+          if grep -q "application-debuggable" artifacts/apk-info.txt; then echo 'APK must not be debuggable' >&2; exit 1; fi
+          "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" | tee artifacts/apk-signing.txt
+          "${ANDROID_HOME}/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "$APK" > artifacts/apk-alignment.txt
+          cp source/Android/RiOsTIrusApp/README.md artifacts/README-RiOsTIrus.md
+          echo '### RiOsTIrus 0.1.0 ARM64' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Test bench for the Virus TI engine. New app (com.rinoize.riostirus); does not replace RiGear or RiXenia.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload APK and reports
+        if: success() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RiOsTIrus-0.1.0-arm64
+          path: artifacts/
+          retention-days: 90
+          if-no-files-found: error
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RiOsTIrus-0.1.0-build-diagnostics
+          path: artifacts/
+          retention-days: 90
+          if-no-files-found: warn

@@ -32,6 +32,8 @@ namespace virusLib
 		dsp56k::DSP& getDSP() const { return *m_dsp; }
 		dsp56k::Jit& getJIT() const { return *m_jit; }
 		dsp56k::Memory& getMemory() const {return *m_memory; }
+		// Diagnostics: null until startDSPThread()
+		dsp56k::DSPThread* getDSPThread() const { return m_dspThread.get(); }
 
 		void startDSPThread(bool _createDebugger);
 

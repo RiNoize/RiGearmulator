@@ -45,6 +45,10 @@ namespace virusLib
 		uint32_t getInternalLatencyMidiToOutput() const override;
 		uint32_t getInternalLatencyInputToOutput() const override;
 
+		// Diagnostics (RiOsTIrus): DSP A and, on TI/TI2, DSP B. Null when absent.
+		DspSingle* getDspA() const { return m_dsp.get(); }
+		DspSingle* getDspB() const { return m_dsp2; }
+
 		uint32_t getChannelCountIn() override;
 		uint32_t getChannelCountOut() override;
 
