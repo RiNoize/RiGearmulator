@@ -33,6 +33,9 @@ namespace xt
         uint64_t getFirmwareSingleRevision() const { return m_firmwareSingleRevision; }
         const std::vector<uint8_t>& getFirmwareSingle() const { return m_firmwareSingle; }
 
+        // Diagnostics (RiXenia): reach the DSP threads for MIPS readouts.
+        Xt& getXt() { return m_xt; }
+
 	protected:
 		void readMidiOut(std::vector<synthLib::SMidiEvent>& _midiOut) override;
 		void processAudio(const synthLib::TAudioInputs& _inputs, const synthLib::TAudioOutputs& _outputs, size_t _samples) override;

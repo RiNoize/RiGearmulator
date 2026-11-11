@@ -16,4 +16,9 @@ public final class RuntimeBridge {
     public static native void requestPanel();
     public static native long[] signalStats(boolean reset);
     public static native long[] conversionStats();
+    /** 0 Automatico, 1 Rendimiento (nucleos rapidos), 2 Repartido (un nucleo rapido por hilo).
+     * Applies to the engine's DSP and MC68331 threads. Audio must be stopped. Returns a summary. */
+    public static native String setCpuPlacement(int mode);
+    /** Monitor thread only: per-thread usage since the previous call, CPU, mask, nice, DSP MIPS. */
+    public static native String placementReport();
 }

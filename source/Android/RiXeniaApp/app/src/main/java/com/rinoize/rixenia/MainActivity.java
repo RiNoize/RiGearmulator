@@ -48,7 +48,7 @@ public final class MainActivity extends Activity {
     private TextView display,stats,status,footer,diagnostics;
     private Button play,stop,romButton,bankButton;
     private FrameLayout body;
-    private Spinner blockChoice,rateChoice,modeChoice,outputChoice,midiChoice;
+    private Spinner blockChoice,rateChoice,modeChoice,outputChoice,midiChoice,cpuChoice;
     private List<MidiInput.Choice> ports=new ArrayList<>();
     private RealtimeAudio.Session measured;
     private interface Job { void run() throws Exception; }
@@ -76,7 +76,7 @@ public final class MainActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN|View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
         LinearLayout root=column();root.setBackgroundColor(BG);root.setPadding(dp(10),dp(6),dp(10),dp(5));
         LinearLayout header=row();TextView title=text("RiXenia",22,ORANGE);title.setTypeface(Typeface.DEFAULT,Typeface.BOLD);header.addView(title);
-        TextView sub=text("  Microwave II / XT  ·  0.2.0 α",12,MUTED);header.addView(sub,new LinearLayout.LayoutParams(0,-2,1));
+        TextView sub=text("  Microwave II / XT  ·  0.2.1 α",12,MUTED);header.addView(sub,new LinearLayout.LayoutParams(0,-2,1));
         play=button("▶ INICIAR",ORANGE,v->startAudio());stop=button("■ DETENER",BLUE,v->stopAudio());
         addTransport(header,play);addTransport(header,stop);addTransport(header,button("PANIC",0xffff7787,v->panic()));root.addView(header,new LinearLayout.LayoutParams(-1,dp(40)));
         stats=text("Motor detenido",11,MUTED);root.addView(stats);
@@ -127,7 +127,8 @@ public final class MainActivity extends Activity {
         if(!ready){message("Primero cargá tu ROM en CONFIGURACIÓN.");return;}
         final int frames=BLOCKS[bounded(prefs.getInt("block",1),BLOCKS.length)],rate=RATES[bounded(prefs.getInt("rate",0),RATES.length)];
         final int mode=bounded(prefs.getInt("mode",0),2),output=OUTPUTS[bounded(prefs.getInt("output",2),OUTPUTS.length)],gain=gainDb;
-        work("Iniciando audio…",()->{if(!visible)return;audio.start(frames,100,0,gain,mode,output,rate);midiGate=true;lastError="";post(()->message("Audio activo. Canal MIDI 1 por defecto; sustain, modulación y pitch bend habilitados."));});
+        final int cpu=bounded(prefs.getInt("cpu",RealtimeAudio.CPU_AUTOMATIC),3);
+        work("Iniciando audio…",()->{if(!visible)return;audio.start(frames,100,0,gain,mode,output,rate,cpu);midiGate=true;lastError="";post(()->message("Audio activo. Canal MIDI 1 por defecto; sustain, modulación y pitch bend habilitados."));});
     }
     private void stopAudio(){work("Deteniendo audio…",()->{stopWorker();RuntimeBridge.panic();post(()->message("Audio detenido"));});}
     private void panic(){
@@ -191,6 +192,7 @@ public final class MainActivity extends Activity {
         play.setEnabled(available&&ready&&!audio.hasLiveSession());stop.setEnabled(available&&audio.hasLiveSession());
         for(Button b:needsEngine)b.setEnabled(available&&ready);
         if(romButton!=null)romButton.setEnabled(available);if(bankButton!=null)bankButton.setEnabled(available);
+        if(cpuChoice!=null)cpuChoice.setEnabled(available&&!audio.hasLiveSession());
         if(editor!=null)editor.setAvailable(available&&ready&&currentKnown&&patchPhase==0,available&&ready);
     }
     private void setDisplay(String text){if(!text.contentEquals(display.getText()))display.setText(text);}
@@ -209,7 +211,7 @@ public final class MainActivity extends Activity {
         setDisplay(heading+"\n"+name);
     }
     private void showPage(int selected){
-        page=selected;romButton=bankButton=null;diagnostics=null;body.removeAllViews();
+        page=selected;romButton=bankButton=null;cpuChoice=null;diagnostics=null;body.removeAllViews();
         for(int i=0;i<navTabs.size();i++)SynthUi.styleButton(navTabs.get(i),BLUE,i==page);
         ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);
         if(page==0){
@@ -256,6 +258,8 @@ public final class MainActivity extends Activity {
         modeChoice=setting(config,"Modo",new String[]{"Conservador","Baja latencia + AUTO"},"mode",0);
         outputChoice=setting(config,"Buffer salida",new String[]{"512","768","1024","1536","2048","2304","3072","4096"},"output",2);content.addView(config);
         content.addView(text("Los cambios de audio se aplican al detener e iniciar. 512 / 48000 Hz / Conservador es el punto de partida. Motor a 100% y expansión de voces desactivada.",11,MUTED));
+        LinearLayout cores=row();cpuChoice=setting(cores,"Núcleos (hilos DSP y MC68331)",new String[]{"Automático (Android decide)","Rendimiento: núcleos rápidos","Repartido: un núcleo rápido por hilo"},"cpu",RealtimeAudio.CPU_AUTOMATIC);content.addView(cores);
+        content.addView(text("Prueba A/B: tocá el mismo patch en Automático y en Rendimiento y compará el uso de «DSP A» en el diagnóstico. Si se acerca a 100% de un núcleo, el DSP no llega a tiempo real.",11,MUTED));
         LinearLayout connection=row();midiChoice=new Spinner(this);connection.addView(midiChoice,new LinearLayout.LayoutParams(0,dp(44),1));
         connection.addView(button("CONECTAR MIDI",BLUE,v->{if(ports.isEmpty()){message("No hay puertos MIDI disponibles");return;}try{midi.connect(ports.get(Math.max(0,midiChoice.getSelectedItemPosition())));}catch(RuntimeException e){message(e.getMessage());}}));
         connection.addView(button("DESCONECTAR",BLUE,v->midi.disconnect()));content.addView(connection);refreshPorts();
@@ -263,7 +267,7 @@ public final class MainActivity extends Activity {
             android.content.ClipboardManager clip=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
             if(clip!=null) {
                 clip.setPrimaryClip(android.content.ClipData.newPlainText("RiXenia diagnóstico",
-                    "RiXenia 0.2.0 · "+android.os.Build.MANUFACTURER+" "+android.os.Build.MODEL+
+                    "RiXenia 0.2.1 · "+android.os.Build.MANUFACTURER+" "+android.os.Build.MODEL+
                     " · Android "+android.os.Build.VERSION.RELEASE+"\n"+display.getText()+"\n"+
                     stats.getText()+"\n"+footer.getText()+"\n"+audio.diagnosticReport()));
                 message("Diagnóstico copiado. Podés pegarlo en el chat; no contiene ROM ni bancos.");
@@ -286,7 +290,7 @@ public final class MainActivity extends Activity {
             if(session!=null&&audio.isRunning()){
                 long[] totals=session.meter.snapshot();double[] window=renderWindow.sample(System.nanoTime(),totals,session.deviceSampleRate);
                 stats.setText(String.format(Locale.ROOT,"Render %.1f%%  ·  CPU app %.1f%%  ·  OV %d · %.1f OV/s  ·  underruns %d  ·  %d → %d Hz",window[0],appCpu,totals[4],window[1],session.underruns,session.deviceSampleRate,session.sampleRate));
-                if(diagnostics!=null){RealtimeAudio.OutputState s=session.output;diagnostics.setText(session.configuration+"\nSalida: "+s.effectiveFrames+" frames / capacidad "+s.capacityFrames+" · "+RealtimeAudio.performanceName(s.performanceMode)+"\n"+s.route+(session.monitorNote.isEmpty()?"":"\n"+session.monitorNote)+"\n"+audio.healthSummary());}
+                if(diagnostics!=null){RealtimeAudio.OutputState s=session.output;diagnostics.setText(session.configuration+"\nSalida: "+s.effectiveFrames+" frames / capacidad "+s.capacityFrames+" · "+RealtimeAudio.performanceName(s.performanceMode)+"\n"+s.route+(session.monitorNote.isEmpty()?"":"\n"+session.monitorNote)+"\n"+audio.healthSummary()+"\n"+session.placementSummary+(session.placement.isEmpty()?"":"\n"+session.placement));}
             }else stats.setText(String.format(Locale.ROOT,"%s  ·  CPU app %.1f%%",busy?"Preparando motor…":"Motor detenido",appCpu));
             if(session!=null&&!session.error.isEmpty()&&!session.error.equals(lastError)){lastError=session.error;message(session.error);midiGate=false;}
             refreshPatchState();

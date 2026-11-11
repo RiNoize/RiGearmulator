@@ -16,10 +16,12 @@
 #include <vector>
 
 #include "xtLib/xtDevice.h"
+#include "xtLib/xtHardware.h"
 #include "synthLib/device.h"
 #include "XeniaProtocol.h"
 #include "XeniaResampler.h"
 #include "XeniaDispatch.h"
+#include "ThreadPlacement.h"
 
 namespace {
 using Event = synthLib::SMidiEvent;
@@ -69,6 +71,21 @@ std::atomic<float> targetGain{1.0f};
 float appliedGain = 1.0f;
 std::atomic<std::uint64_t> clips{0}, badSamples{0}, peakBits{0};
 std::atomic<std::uint64_t> srcNanos{0}, srcMaxNanos{0}, srcInputs{0}, srcOutputs{0};
+
+// CPU placement of the engine's own worker threads. The DSP and the MC68331 run
+// in threads created by xtLib; the Java render thread only exchanges buffers.
+// The placer has its own mutex: the monitor never takes deviceMutex, so it can
+// not stall the render thread. dspThread is cleared before the device is reset;
+// Java stops audio and its monitor before loading or releasing.
+rinoize::ThreadPlacer placer;
+std::atomic<dsp56k::DSPThread*> dspThread{nullptr};
+const std::vector<std::string> placedThreads{"DSP A", "MC68331"};
+const std::vector<std::string> watchedThreads{"RiXenia-Audio"};
+void releaseDeviceLocked() {
+    dspThread.store(nullptr);
+    placer.forget();
+    device.reset();
+}
 
 void throwJava(JNIEnv* env, const char* text) {
     if (env->ExceptionCheck()) return;
@@ -243,7 +260,7 @@ Java_com_rinoize_rixenia_NativeBridge_nativeLoadRom(JNIEnv* env, jclass, jbyteAr
         auto filename = stringFromJava(env, name);
         std::lock_guard<std::mutex> lock(deviceMutex);
         // Java performs this on its serial control worker, with AudioTrack stopped.
-        device.reset(); preparedFrames = 0; convert48 = false; sysexCooldown = 0;
+        releaseDeviceLocked(); preparedFrames = 0; convert48 = false; sysexCooldown = 0;
         {
             std::lock_guard<std::mutex> midiLock(midiMutex);
             shortQueue.clear(); sysexQueue.clear(); sysexBytes = 0; decoder.reset();
@@ -257,8 +274,12 @@ Java_com_rinoize_rixenia_NativeBridge_nativeLoadRom(JNIEnv* env, jclass, jbyteAr
         params.romData = std::move(rom); params.romName = std::move(filename);
         params.preferredSamplerate = 40000.0f; params.hostSamplerate = 48000.0f;
         params.customData = 0; // Base 10-voice hardware; no three-DSP expansion.
-        device = std::make_unique<xt::Device>(params);
-        if (!device->isValid()) { device.reset(); throw std::runtime_error("Xenia no pudo iniciar la ROM."); }
+        auto created = std::make_unique<xt::Device>(params);
+        if (!created->isValid()) throw std::runtime_error("Xenia no pudo iniciar la ROM.");
+        auto* hardware = created->getXt().getHardware();
+        if (hardware && hardware->getDspCount() > hardware->getMainDspIdx())
+            dspThread.store(&hardware->getDspThread(hardware->getMainDspIdx()));
+        device = std::move(created);
         device->setDspClockPercent(100);
         finishFirmwareSetup();
         {
@@ -404,7 +425,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_rinoize_rixenia_NativeBridge_nativeRelease(JNIEnv* env, jclass) {
     guardedVoid(env, [] {
         std::lock_guard<std::mutex> lock(deviceMutex);
-        device.reset(); preparedFrames = 0; convert48 = false; sysexCooldown = 0;
+        releaseDeviceLocked(); preparedFrames = 0; convert48 = false; sysexCooldown = 0;
         interleaved.clear(); converted.clear();
         std::lock_guard<std::mutex> midiLock(midiMutex);
         shortQueue.clear(); sysexQueue.clear(); sysexBytes = 0; decoder.reset();
@@ -623,5 +644,30 @@ Java_com_rinoize_rixenia_RuntimeBridge_conversionStats(JNIEnv* env, jclass) {
         const jlong values[] = {static_cast<jlong>(srcNanos.load()), static_cast<jlong>(srcMaxNanos.load()),
             static_cast<jlong>(srcInputs.load()), static_cast<jlong>(srcOutputs.load())};
         auto result = env->NewLongArray(4); if (result) env->SetLongArrayRegion(result, 0, 4, values); return result;
+    });
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_rixenia_RuntimeBridge_setCpuPlacement(JNIEnv* env, jclass, jint mode) {
+    return guarded<jstring>(env, nullptr, [&] {
+        if (mode < 0 || mode > 2) throw std::invalid_argument("Modo de nucleos invalido.");
+        // Control worker, audio stopped: the engine threads exist since the ROM boot.
+        std::lock_guard<std::mutex> lock(deviceMutex); ensureDevice();
+        const auto summary = placer.apply(static_cast<rinoize::PlacementMode>(mode), placedThreads, watchedThreads);
+        return env->NewStringUTF(summary.c_str());
+    });
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_rixenia_RuntimeBridge_placementReport(JNIEnv* env, jclass) {
+    return guarded<jstring>(env, nullptr, [&] {
+        // Monitor thread only (500 ms): usage is measured between consecutive calls.
+        std::string text = placer.report();
+        // getCurrentMips() is refreshed by the DSP thread about twice per second;
+        // an unsynchronized read of a diagnostic double, never used for control.
+        if (const auto* thread = dspThread.load()) {
+            char mips[48];
+            std::snprintf(mips, sizeof(mips), "DSP A: %.1f MIPS", thread->getCurrentMips());
+            text += (text.empty() ? "" : "\n") + std::string(mips);
+        }
+        return env->NewStringUTF(text.c_str());
     });
 }

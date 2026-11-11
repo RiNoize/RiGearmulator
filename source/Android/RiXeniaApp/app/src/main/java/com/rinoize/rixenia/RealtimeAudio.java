@@ -18,6 +18,7 @@ import android.os.SystemClock;
  */
 public final class RealtimeAudio {
     public static final int CONSERVATIVE = 0, LOW_LATENCY = 1;
+    public static final int CPU_AUTOMATIC = 0, CPU_PERFORMANCE = 1, CPU_SPREAD = 2;
     private static final int ADAPTIVE_QUANTUM_FRAMES = 256;
     private static final long ADAPTIVE_GRACE_NANOS = 2_000_000_000L;
     private static final long ADAPTIVE_MIN_INTERVAL_NANOS = 1_000_000_000L;
@@ -50,6 +51,8 @@ public final class RealtimeAudio {
         public volatile boolean stopRequested, monitorStop, playing, finished;
         public volatile int underruns, adaptiveChanges, adaptiveFrames;
         public volatile String error = "", monitorNote = "";
+        /** Placement applied at start, and the latest per-thread report from the monitor. */
+        public volatile String placementSummary = "", placement = "";
         public volatile OutputState output;
         public volatile long srcNanos, srcMaxNanos, srcInputFrames, srcOutputFrames;
         private volatile int lastObservedUnderruns;
@@ -80,7 +83,8 @@ public final class RealtimeAudio {
     }
 
     public void start(int frames, int clockPercent, int extraFrames, int gainDb,
-                      int outputMode, int requestedOutputFrames, int requestedRate) throws Exception {
+                      int outputMode, int requestedOutputFrames, int requestedRate,
+                      int cpuPlacement) throws Exception {
         stop();
         if (outputMode != CONSERVATIVE && outputMode != LOW_LATENCY)
             throw new IllegalArgumentException("Modo de salida desconocido");
@@ -88,12 +92,16 @@ public final class RealtimeAudio {
             throw new IllegalArgumentException("Buffer de salida fuera de rango");
         if (requestedRate != 0 && requestedRate != 48000)
             throw new IllegalArgumentException("Seleccionar Nativa o 48000 Hz");
+        if (cpuPlacement < CPU_AUTOMATIC || cpuPlacement > CPU_SPREAD)
+            throw new IllegalArgumentException("Modo de nucleos desconocido");
         RuntimeBridge.setGainDb(gainDb);
         String configuration = RuntimeBridge.prepare(frames, clockPercent, extraFrames);
         int nativeRate = NativeBridge.nativeGetDeviceSampleRate();
         if (nativeRate <= 0) throw new IllegalStateException("No device sample rate");
         int sampleRate = requestedRate == 0 ? nativeRate : requestedRate;
         RuntimeBridge.configureOutput(sampleRate);
+        // Engine worker threads exist since the ROM boot; place them before rendering.
+        String placementSummary = RuntimeBridge.setCpuPlacement(cpuPlacement);
         int maxOutputFrames = AudioSizing.maxOutputFrames(frames, nativeRate, sampleRate);
         int minBytes = AudioTrack.getMinBufferSize(sampleRate,
                 AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_FLOAT);
@@ -125,6 +133,7 @@ public final class RealtimeAudio {
             }
             Session s = new Session(track, frames, nativeRate, sampleRate, configuration, outputMode,
                     outputMode == CONSERVATIVE ? 0 : requestedOutputFrames, extraFrames);
+            s.placementSummary = placementSummary == null ? "" : placementSummary;
             s.worker = new Thread(() -> run(s), "RiXenia-Audio");
             current = s;
             try { s.worker.start(); }
@@ -138,7 +147,8 @@ public final class RealtimeAudio {
 
     public String diagnosticReport() {
         Session s = current; return s == null ? "Sin sesión de audio" :
-                s.configuration + "\n" + s.output.route + "\n" + s.health.report();
+                s.configuration + "\n" + s.output.route + "\n" + s.health.report() +
+                "\n" + s.placementSummary + (s.placement.isEmpty() ? "" : "\n" + s.placement);
     }
 
     private static int threshold(AudioTrack track) {
@@ -194,6 +204,8 @@ public final class RealtimeAudio {
             s.meter.drainWindow(s.renderWindow);
             s.health.observe(now, observedUnderruns, beforeFrames, effective,
                     s.output.capacityFrames, pending, s.renderWindow, cpu);
+            String placement = RuntimeBridge.placementReport();
+            if (placement != null) s.placement = placement;
             if (s.resampling) {
                 long[] stats = RuntimeBridge.conversionStats();
                 if (stats != null && stats.length == 4) {

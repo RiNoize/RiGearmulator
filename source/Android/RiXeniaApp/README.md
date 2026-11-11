@@ -1,4 +1,17 @@
-# RiXenia Android 0.2.0 alpha — Cyan Studio
+# RiXenia Android 0.2.1 alpha — Cyan Studio
+
+## Núcleos 0.2.1
+
+En Gearmulator el trabajo pesado no ocurre en el hilo de audio Java: el DSP corre en su propio hilo (`DSP A`) y el 68k en `MC68331`. El render sólo intercambia buffers con ellos. CONFIGURACIÓN → «Núcleos» elige dónde corren esos dos hilos:
+
+- **Automático**: Android decide (comportamiento de 0.2.0). Si antes se aplicó otro modo, restaura la máscara original.
+- **Rendimiento**: ambos hilos restringidos al grupo de CPUs de mayor `cpu_capacity` permitido (en la Galaxy Tab A9, 6-7).
+- **Repartido**: un núcleo rápido por hilo (`DSP A` → el primero, `MC68331` → el segundo).
+
+La selección se aplica al iniciar el audio; el selector se deshabilita mientras suena. El helper (`source/Android/common/ThreadPlacement.h`) sigue la política de RiMU2000: candidatos limitados a la máscara original, capacidad antes que MHz, máximo exacto, sin escribir sysfs. A diferencia de RiMU2000, los hilos se ubican por nombre en `/proc/self/task` porque los crea el motor, no el callback.
+
+El diagnóstico muestra por hilo: CPU actual, uso (100% = un núcleo, medido cada 500 ms), máscara leída y nice real, más los MIPS del DSP. Un `DSP A` cerca de 100% indica que el DSP no llega a tiempo real. Prueba A/B: mismo patch, mismo buffer, Automático contra Rendimiento.
+
 
 Aplicación independiente ARM64 para Xenia / Waldorf Microwave II–XT de Gearmulator. Usa xtLib, un DSP, reloj 100%, sin expansión de voces.
 
