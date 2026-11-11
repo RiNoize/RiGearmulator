@@ -115,10 +115,11 @@ void testLiveThreads() {
     require(rinoize::findThreadsByName("nope").empty(), "unknown name");
 
     rinoize::ThreadPlacer placer(sysfs);
+    const auto original = rinoize::placementDetail::maskToString(process); // runner dependent, e.g. 0-1 or 0-3
     auto summary = placer.apply(rinoize::PlacementMode::Performance, {"DSP A", "MC68331", "DSP B"});
     require(summary.find("criterio capacidad") != std::string::npos, "summary criterion: " + summary);
-    require(summary.find("DSP A 0-1->1") != std::string::npos, "DSP A placed on 1: " + summary);
-    require(summary.find("MC68331 0-1->1") != std::string::npos, "MC68331 placed on 1: " + summary);
+    require(summary.find("DSP A " + original + "->1") != std::string::npos, "DSP A placed on 1: " + summary);
+    require(summary.find("MC68331 " + original + "->1") != std::string::npos, "MC68331 placed on 1: " + summary);
     require(summary.find("DSP B no encontrado") != std::string::npos, "missing thread reported: " + summary);
 
     const pid_t tid = rinoize::findThreadsByName("DSP A").front();
