@@ -13,4 +13,8 @@ public final class NativeBridge {
     public static native void nativeResetMidiStats();
     public static native String nativeGetMidiStats();
     public static native void nativeRelease();
+    /** One line per ROM single: bank, program, name, category1, category2, version, flags (tab separated). */
+    public static native String nativeLibrary();
+    /** Loads a ROM single into the edit buffer; returns its name. */
+    public static native String nativeSelectPatch(int bank, int program);
 }

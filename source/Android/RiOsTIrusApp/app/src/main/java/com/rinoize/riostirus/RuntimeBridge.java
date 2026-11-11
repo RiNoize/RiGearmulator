@@ -15,4 +15,11 @@ public final class RuntimeBridge {
     public static native String setCpuPlacement(int mode);
     /** Monitor thread only: per-thread usage since the previous call, CPU, mask, nice, MIPS per DSP. */
     public static native String placementReport();
+    /** page 0x70/0x71/0x6E/0x6F, index 0..127, value 0..127. Coalesced; never blocks on the engine. */
+    public static native boolean setParameter(int page, int index, int value);
+    /** [revision, flags (1 known, 2 external program change pending), bank, program, values...]. */
+    public static native int[] values(int[] pages, int[] indices);
+    public static native String currentName();
+    /** Control thread: re-read the firmware edit buffer. external = after a keyboard Program Change. */
+    public static native boolean syncFromEngine(boolean external);
 }

@@ -1,6 +1,17 @@
-# RiOsTIrus Android 0.1.0 alpha — banco de pruebas Virus TI
+# RiOsTIrus Android 0.2.0 alpha — Snow White
 
-App ARM64 independiente (`com.rinoize.riostirus`) para medir si el motor de OsTIrus (Gearmulator `virusLib`, Virus TI / TI2 / Snow) llega a tiempo real en la Galaxy Tab A9. No reemplaza a RiGear ni a RiXenia. No tiene editor ni biblioteca: firmware, audio, MIDI, núcleos y diagnóstico.
+## Interfaz 0.2.0
+
+Tres pantallas, estilo blanco como el Virus TI Snow (perillas grafito, acentos rojos, display oscuro):
+
+- **TOCAR**: display con banco, número, categorías y nombre; PATCH ◀ ▶ recorre la lista actual de la biblioteca (una categoría filtrada funciona como set list); BANK −/+ salta de banco; ☆ marca favorito. 25 perillas de performance: osciladores, filtros, envolventes de filtro y amplificador, efectos (chorus, delay, reverb, distorsión) y master. Arrastre vertical; un toque permite escribir el valor exacto. Los valores vienen del patch cargado y se actualizan si el teclado envía CC o Program Change.
+- **BIBLIOTECA**: como el patch manager del plugin OsTIrus. Colecciones (todos, favoritos, recientes, cada banco ROM con los nombres del plugin: TI A–S, TI2 A–Y, Snow A–H), categorías del patch (Category 1/2: Lead, Bass, Pad, Decay, Pluck, Acid…) con conteo, etiquetas Arp/Unison/Chorus/Phaser, búsqueda por nombre, orden por banco o nombre. «Sin duplicados» muestra cada nombre una vez (el firmware repite la mayoría de los sonidos entre TI, TI2 y Snow: 6656 patches, 3119 nombres). Tocar carga el patch; mantener apretado lo marca como favorito.
+- **AJUSTES**: el banco de pruebas de 0.1.0 (firmware, modelo, audio, núcleos, MIDI, diagnóstico).
+
+Los patches se cargan enviando el single al edit buffer, igual que el plugin. Las perillas mandan cambios de parámetro SysEx (páginas A, B y 6E), coalescidos para no saturar el firmware.
+
+
+App ARM64 independiente (`com.rinoize.riostirus`) para medir si el motor de OsTIrus (Gearmulator `virusLib`, Virus TI / TI2 / Snow) llega a tiempo real en la Galaxy Tab A9. No reemplaza a RiGear ni a RiXenia. 
 
 ## Firmware
 

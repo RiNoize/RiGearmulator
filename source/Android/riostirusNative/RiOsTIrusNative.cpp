@@ -20,6 +20,8 @@
 #include "virusLib/device.h"
 #include "virusLib/deviceModel.h"
 #include "virusLib/dspSingle.h"
+#include "virusLib/microcontroller.h"
+#include "virusLib/romfile.h"
 #include "dsp56kEmu/dspthread.h"
 #include "MidiBytes.h"
 #include "ThreadPlacement.h"
@@ -35,6 +37,16 @@ constexpr std::size_t maxShortEvents = 4096, maxSysexEvents = 256, maxSysexBytes
 std::mutex deviceMutex, midiMutex;
 std::unique_ptr<virusLib::Device> device;
 virusLib::DeviceModel deviceModel = virusLib::DeviceModel::Invalid;
+std::unique_ptr<virusLib::ROMFile> romIndex;
+
+// Current single (512 bytes: page A, B, 6E, 6F). Updated on patch selection, knob
+// changes, external page A CCs, and re-read from the firmware's edit buffer.
+// Guarded by midiMutex. currentKnown is false until the first read.
+virusLib::ROMFile::TPreset currentSingle{};
+bool currentKnown = false;
+bool externalChange = false;   // Program Change / bank select from the keyboard: re-read edit buffer
+std::uint32_t currentRevision = 1;
+int currentBank = -1, currentProgram = -1;
 
 std::deque<Event> shortQueue, sysexQueue;
 std::size_t sysexBytes = 0;
@@ -63,9 +75,44 @@ void releaseDeviceLocked() {
     dspA.store(nullptr); dspB.store(nullptr);
     placer.forget();
     device.reset();
+    romIndex.reset();
     deviceModel = virusLib::DeviceModel::Invalid;
     preparedFrames = 0;
+    std::lock_guard<std::mutex> midiLock(midiMutex);
+    currentKnown = false; currentBank = currentProgram = -1; ++currentRevision;
 }
+
+int pageOffset(int page) {
+    switch (page) {
+        case 0x70: return 0;
+        case 0x71: return 128;
+        case 0x6e: return 256;
+        case 0x6f: return 384;
+        default: return -1;
+    }
+}
+
+// Re-read the firmware's single edit buffer (after a Program Change from the
+// keyboard, or to confirm a selection). Caller holds deviceMutex, not midiMutex.
+bool syncFromEngineLocked() {
+    if (!device) return false;
+    std::vector<std::uint8_t> state;
+    if (!device->getState(state, synthLib::StateTypeCurrentProgram)) return false;
+    // Single dump of the edit buffer: F0 00 20 33 01 dd 10 00 40 <256> cs <256> cs F7
+    for (std::size_t i = 0; i + 524 <= state.size(); ++i) {
+        if (state[i] != 0xf0 || state[i + 1] != 0x00 || state[i + 2] != 0x20 || state[i + 3] != 0x33 ||
+            state[i + 6] != 0x10 || state[i + 7] != 0x00 || state[i + 8] != 0x40)
+            continue;
+        if (state[i + 523] != 0xf7) continue;
+        std::lock_guard<std::mutex> midiLock(midiMutex);
+        for (std::size_t b = 0; b < 256; ++b) currentSingle[b] = state[i + 9 + b];
+        for (std::size_t b = 0; b < 256; ++b) currentSingle[256 + b] = state[i + 266 + b];
+        currentKnown = true; ++currentRevision;
+        return true;
+    }
+    return false;
+}
+
 
 void throwJava(JNIEnv* env, const char* text) {
     if (env->ExceptionCheck()) return;
@@ -108,11 +155,39 @@ bool enqueueShortLocked(std::uint8_t a, std::uint8_t b, std::uint8_t c) {
     if (command == 0x90 || command == 0x80) {
         ++midiNotes;
         if (command == 0x90 && c) seenNotes[a & 15][b & 127] = true;
-    } else if (command == 0xb0) ++midiCc;
-    else if (command == 0xc0) ++midiPc;
+    } else if (command == 0xb0) {
+        ++midiCc;
+        // Virus page A parameters follow the CC numbers. Skip bank select and controllers
+        // that are not patch data (mod wheel, breath, foot, data entry, volume, sustain...).
+        if (currentKnown && b >= 5 && b != 6 && b != 7 && b != 32 && b < 120 && (b < 64 || b > 69)) {
+            currentSingle[b] = c; ++currentRevision;
+        }
+    }
+    else if (command == 0xc0) { ++midiPc; externalChange = true; }
     if (shortQueue.size() >= maxShortEvents) { ++midiOverflow; return false; }
     shortQueue.emplace_back(synthLib::MidiEventSource::Host, a, b, c, 0);
     return true;
+}
+// Knob changes: coalesce with a pending change of the same parameter so a fast drag
+// never floods the one-SysEx-per-block queue.
+bool enqueueParamLocked(std::uint8_t page, std::uint8_t index, std::uint8_t value) {
+    for (auto it = sysexQueue.rbegin(); it != sysexQueue.rend(); ++it) {
+        auto& m = it->sysex;
+        if (m.size() == 11 && m[6] == page && m[7] == 0x40 && m[8] == index) { m[9] = value; return true; }
+        if (!(m.size() == 11 && m[6] >= 0x6e && m[6] <= 0x73)) break;   // keep order with dumps
+    }
+    if (sysexQueue.size() >= maxSysexEvents) { ++midiOverflow; return false; }
+    Event event(synthLib::MidiEventSource::Editor);
+    const std::uint8_t bytes[] = {0xf0, 0x00, 0x20, 0x33, 0x01, 0x10, page, 0x40, index, value, 0xf7};
+    event.sysex.assign(std::begin(bytes), std::end(bytes));
+    sysexQueue.emplace_back(std::move(event)); sysexBytes += 11;
+    return true;
+}
+std::string cleanName(const std::string& name) {
+    std::string out;
+    for (const char ch : name) out += (ch >= 32 && ch < 127 && ch != '\t') ? ch : ' ';
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out.empty() ? "(sin nombre)" : out;
 }
 bool enqueueSysexLocked(const Bytes& data) {
     ++midiMessages; ++midiSysex;
@@ -168,10 +243,8 @@ Java_com_rinoize_riostirus_NativeBridge_nativeLoadRom(JNIEnv* env, jclass, jbyte
             shortQueue.clear(); sysexQueue.clear(); sysexBytes = 0; parser.reset();
             for (auto& channel : seenNotes) channel.fill(false);
         }
-        {
-            const virusLib::ROMFile check(rom, filename, deviceModelRequested);
-            if (!check.isValid()) throw std::runtime_error("El archivo no es un firmware de Virus TI reconocido.");
-        }
+        auto index = std::make_unique<virusLib::ROMFile>(rom, filename, deviceModelRequested);
+        if (!index->isValid()) throw std::runtime_error("El archivo no es un firmware de Virus TI reconocido.");
         synthLib::DeviceCreateParams params;
         params.romData = std::move(rom); params.romName = filename;
         params.preferredSamplerate = static_cast<float>(sampleRate);
@@ -186,14 +259,18 @@ Java_com_rinoize_riostirus_NativeBridge_nativeLoadRom(JNIEnv* env, jclass, jbyte
             ? std::vector<std::string>{"DSP"} : std::vector<std::string>{"DSP DSP A", "DSP DSP B"};
         deviceModel = deviceModelRequested;
         device = std::move(created);
+        romIndex = std::move(index);
         clearMeters();
+        syncFromEngineLocked();
 
         std::ostringstream out;
         out << "Virus " << virusLib::getModelName(deviceModel)
             << " | " << static_cast<int>(std::lround(device->getSamplerate())) << " Hz"
             << " | DSP " << (dspB.load() ? 2 : 1)
             << " | reloj DSP " << device->getDspClockHz() / 1000000 << " MHz"
-            << " | salidas " << device->getChannelCountOut();
+            << " | salidas " << device->getChannelCountOut()
+            << " | bancos ROM " << romIndex->getNumSingleBanks();
+        if (!romIndex->getOsVersion().empty()) out << " | OS " << romIndex->getOsVersion();
         return env->NewStringUTF(out.str().c_str());
     });
 }
@@ -377,5 +454,123 @@ Java_com_rinoize_riostirus_RuntimeBridge_placementReport(JNIEnv* env, jclass) {
             text += (text.empty() ? "" : "\n") + std::string(mips);
         }
         return env->NewStringUTF(text.c_str());
+    });
+}
+
+// ---------------------------------------------------------------- library and editing
+
+// One line per ROM single: bank \t program \t name \t category1 \t category2 \t version \t flags
+// flags: 1 Arp, 2 Unison, 4 Chorus, 8 Phaser (same tags as the plugin's patch manager).
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_riostirus_NativeBridge_nativeLibrary(JNIEnv* env, jclass) {
+    return guarded<jstring>(env, nullptr, [&] {
+        std::lock_guard<std::mutex> lock(deviceMutex); ensureDevice();
+        std::string out;
+        out.reserve(64 * 128 * 32);
+        const auto banks = static_cast<int>(romIndex->getNumSingleBanks());
+        for (int bank = 0; bank < banks; ++bank) {
+            for (int program = 0; program < 128; ++program) {
+                virusLib::ROMFile::TPreset preset{};
+                if (!romIndex->getSingle(bank, program, preset)) continue;
+                const int flags = (preset[128 + 15] ? 1 : 0) | (preset[384 + 120] ? 2 : 0) |
+                                  (preset[105] ? 4 : 0) | (preset[128 + 85] ? 8 : 0);
+                out += std::to_string(bank) + '\t' + std::to_string(program) + '\t' +
+                       cleanName(virusLib::ROMFile::getSingleName(preset)) + '\t' +
+                       std::to_string(preset[128 + 123]) + '\t' + std::to_string(preset[128 + 124]) + '\t' +
+                       std::to_string(preset[0]) + '\t' + std::to_string(flags) + '\n';
+            }
+        }
+        return env->NewStringUTF(out.c_str());
+    });
+}
+// Loads a ROM single into the single edit buffer (the same dump the plugin sends).
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_riostirus_NativeBridge_nativeSelectPatch(JNIEnv* env, jclass, jint bank, jint program) {
+    return guarded<jstring>(env, nullptr, [&] {
+        if (program < 0 || program > 127) throw std::invalid_argument("Programa fuera de rango.");
+        std::lock_guard<std::mutex> lock(deviceMutex); ensureDevice();
+        if (bank < 0 || bank >= static_cast<int>(romIndex->getNumSingleBanks())) throw std::invalid_argument("Banco fuera de rango.");
+        virusLib::ROMFile::TPreset preset{};
+        if (!romIndex->getSingle(bank, program, preset)) throw std::runtime_error("No se pudo leer ese patch de la ROM.");
+        const auto dump = virusLib::Microcontroller::createSingleDump(*romIndex, virusLib::BankNumber::EditBuffer,
+                                                                     virusLib::SINGLE, preset);
+        std::lock_guard<std::mutex> midiLock(midiMutex);
+        // A newer selection replaces pending edits and dumps: they belong to the previous sound.
+        sysexQueue.clear(); sysexBytes = 0;
+        Bytes bytes(dump.begin(), dump.end());
+        if (!enqueueSysexLocked(bytes)) throw std::runtime_error("Cola MIDI llena.");
+        --midiMessages; --midiSysex;     // internal, not counted as received MIDI
+        currentSingle = preset; currentKnown = true; ++currentRevision;
+        currentBank = bank; currentProgram = program; externalChange = false;
+        const auto name = cleanName(virusLib::ROMFile::getSingleName(preset));
+        return env->NewStringUTF(name.c_str());
+    });
+}
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_rinoize_riostirus_RuntimeBridge_setParameter(JNIEnv* env, jclass, jint page, jint index, jint value) {
+    return guarded<jboolean>(env, JNI_FALSE, [&] {
+        const int offset = pageOffset(page);
+        if (offset < 0 || index < 0 || index > 127 || value < 0 || value > 127)
+            throw std::invalid_argument("Parametro fuera de rango.");
+        if (page == 0x70 && index == 0) throw std::invalid_argument("La version del patch no se edita.");
+        std::lock_guard<std::mutex> lock(midiMutex);
+        if (!enqueueParamLocked(static_cast<std::uint8_t>(page), static_cast<std::uint8_t>(index), static_cast<std::uint8_t>(value)))
+            return static_cast<jboolean>(JNI_FALSE);
+        currentSingle[static_cast<std::size_t>(offset + index)] = static_cast<std::uint8_t>(value); ++currentRevision;
+        return static_cast<jboolean>(JNI_TRUE);
+    });
+}
+// Returns [revision, known, bank, program, values for each (page, index) pair...]; -1 when unknown.
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_rinoize_riostirus_RuntimeBridge_values(JNIEnv* env, jclass, jintArray pages, jintArray indices) {
+    return guarded<jintArray>(env, nullptr, [&] {
+        if (!pages || !indices || env->GetArrayLength(pages) != env->GetArrayLength(indices))
+            throw std::invalid_argument("Listas de parametros invalidas.");
+        const auto count = env->GetArrayLength(pages);
+        std::vector<jint> p(static_cast<std::size_t>(count)), i(static_cast<std::size_t>(count));
+        env->GetIntArrayRegion(pages, 0, count, p.data()); env->GetIntArrayRegion(indices, 0, count, i.data());
+        std::vector<jint> result(static_cast<std::size_t>(count) + 4, -1);
+        {
+            std::lock_guard<std::mutex> lock(midiMutex);
+            result[0] = static_cast<jint>(currentRevision & 0x7fffffffu);
+            result[1] = (currentKnown ? 1 : 0) | (externalChange ? 2 : 0);
+            result[2] = currentBank; result[3] = currentProgram;
+            for (jsize k = 0; k < count; ++k) {
+                const int offset = pageOffset(p[static_cast<std::size_t>(k)]);
+                const int index = i[static_cast<std::size_t>(k)];
+                if (currentKnown && offset >= 0 && index >= 0 && index < 128)
+                    result[static_cast<std::size_t>(k) + 4] = currentSingle[static_cast<std::size_t>(offset + index)];
+            }
+        }
+        auto array = env->NewIntArray(static_cast<jsize>(result.size()));
+        if (array) env->SetIntArrayRegion(array, 0, static_cast<jsize>(result.size()), result.data());
+        return array;
+    });
+}
+// Current edit buffer name (from the copy), "" when unknown.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_riostirus_RuntimeBridge_currentName(JNIEnv* env, jclass) {
+    return guarded<jstring>(env, nullptr, [&] {
+        std::lock_guard<std::mutex> lock(midiMutex);
+        return env->NewStringUTF(currentKnown ? cleanName(virusLib::ROMFile::getSingleName(currentSingle)).c_str() : "");
+    });
+}
+// Re-read the firmware edit buffer, e.g. after a Program Change from the keyboard.
+// Control thread only: briefly takes deviceMutex, like a render block.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_rinoize_riostirus_RuntimeBridge_syncFromEngine(JNIEnv* env, jclass, jboolean external) {
+    return guarded<jboolean>(env, JNI_FALSE, [&] {
+        std::lock_guard<std::mutex> lock(deviceMutex);
+        {
+            std::lock_guard<std::mutex> midiLock(midiMutex);
+            // Wait until queued edits and the Program Change itself reached the firmware.
+            if (!sysexQueue.empty() || !shortQueue.empty()) return static_cast<jboolean>(JNI_FALSE);
+        }
+        const bool ok = syncFromEngineLocked();
+        if (ok && external) {
+            std::lock_guard<std::mutex> midiLock(midiMutex);
+            currentBank = currentProgram = -1; externalChange = false;
+        }
+        return static_cast<jboolean>(ok);
     });
 }
