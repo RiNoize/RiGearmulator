@@ -37,7 +37,7 @@ import java.util.concurrent.Executors;
  * on the OsTIrus plugin (collections, categories, tags, search, favourites), and the 0.1.0
  * test bench as the settings page. */
 public final class MainActivity extends Activity implements PlayPanel.Host, LibraryPanel.Host {
-    private static final String VERSION = "0.2.0";
+    private static final String VERSION = "0.2.1";
     private static final int PICK_FIRMWARE = 1;
     private static final int MAX_FIRMWARE = 10 * 1024 * 1024;
     private static final int RECENT_LIMIT = 40;
@@ -67,7 +67,7 @@ public final class MainActivity extends Activity implements PlayPanel.Host, Libr
     private LibraryPanel libraryPanel;
     private View[] pages;
     private int page;
-    private volatile boolean busy, ready, visible, destroyed, syncing;
+    private volatile boolean busy, ready, visible, destroyed;
     private boolean nativeOk;
     private int program;
     private volatile int[] held = new int[0];
@@ -356,21 +356,21 @@ public final class MainActivity extends Activity implements PlayPanel.Host, Libr
         playPanel.showPatch(slotText, name.isEmpty() ? p.name : name, infoText, favorites.contains(p.key()));
     }
 
-    /** 200 ms: knob values and the edit-buffer sync after a Program Change from the keyboard. */
+    /** 200 ms: knob values. Only the MIDI lock is touched, never the engine. A Program Change
+     * from the keyboard is re-read by the render thread itself; here it shows up as a new
+     * revision with no ROM slot, so the display switches to the edit buffer. */
+    private int shownRevision = -1;
     private void refreshPanel() {
         if (!nativeOk || !ready || busy) { if (playPanel != null) playPanel.bind(null, false); return; }
         try {
             int[] values = RuntimeBridge.values(playPanel.pages, playPanel.indices);
+            if (values == null) return;
             playPanel.bind(values, true);
-            if (values != null && (values[1] & 2) != 0 && !syncing && audio.isRunning()) {
-                syncing = true;
-                control.execute(() -> {
-                    try {
-                        if (RuntimeBridge.syncFromEngine(true)) post(() -> { currentKey = ""; libraryPanel.repaint(); updateDisplay(); });
-                    } catch (RuntimeException ignored) {
-                    } finally { syncing = false; }
-                });
-            }
+            if (values[0] == shownRevision) return;
+            shownRevision = values[0];
+            String key = values[2] >= 0 && values[3] >= 0 ? values[2] + ":" + values[3] : "";
+            if (!key.equals(currentKey)) { currentKey = key; libraryPanel.repaint(); }
+            updateDisplay();
         } catch (RuntimeException | LinkageError e) { message(e.getMessage()); }
     }
 

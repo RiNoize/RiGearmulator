@@ -1,4 +1,14 @@
-# RiOsTIrus Android 0.2.0 alpha — Snow White
+# RiOsTIrus Android 0.2.1 alpha — Snow White
+
+## Audio 0.2.1
+
+0.2.0 agregó trabajo que podía demorar al hilo de audio. En 0.2.1 sólo el render (y iniciar/detener) toma el candado del motor:
+
+- Tras un Program Change del teclado, el edit buffer se relee dentro del propio render (~150 ms después, una vez), no desde otro hilo cada 200 ms.
+- Elegir un patch de la biblioteca ya no toma el candado del motor (sólo el índice de ROM y la cola MIDI).
+- En Rendimiento y Repartido, los hilos de la interfaz (principal y RenderThread) quedan fuera de los núcleos rápidos: en la A9 los dos están ocupados por los DSP del TI. Automático los restaura.
+- Diagnóstico «Bloques»: tiempo máximo de `process()` contra el plazo, separado para bloques que cargaron un patch o un cambio de perilla, y bloques lentos acumulados.
+
 
 ## Interfaz 0.2.0
 

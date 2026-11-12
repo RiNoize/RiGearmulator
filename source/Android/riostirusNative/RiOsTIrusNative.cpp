@@ -4,6 +4,7 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -33,8 +34,11 @@ using Bytes = std::vector<std::uint8_t>;
 constexpr std::size_t minRomBytes = 6 * 1024 * 1024, maxRomBytes = 9 * 1024 * 1024; // virusLib romloader limits
 constexpr std::size_t maxShortEvents = 4096, maxSysexEvents = 256, maxSysexBytes = 1024 * 1024;
 
-// Lock order is device -> MIDI. MIDI callbacks only take the MIDI lock.
-std::mutex deviceMutex, midiMutex;
+// Lock order is device -> rom -> MIDI. MIDI callbacks only take the MIDI lock.
+// deviceMutex is held by the render thread for every block: nothing else may take it
+// while audio runs, except start/stop/boot on the control worker. Library browsing and
+// patch selection only need romMutex (the ROM index lifetime) and midiMutex.
+std::mutex deviceMutex, romMutex, midiMutex;
 std::unique_ptr<virusLib::Device> device;
 virusLib::DeviceModel deviceModel = virusLib::DeviceModel::Invalid;
 std::unique_ptr<virusLib::ROMFile> romIndex;
@@ -44,7 +48,18 @@ std::unique_ptr<virusLib::ROMFile> romIndex;
 // Guarded by midiMutex. currentKnown is false until the first read.
 virusLib::ROMFile::TPreset currentSingle{};
 bool currentKnown = false;
-bool externalChange = false;   // Program Change / bank select from the keyboard: re-read edit buffer
+bool externalChange = false;   // Program Change from the keyboard: edit buffer re-read pending
+
+// Render-thread only: blocks left until the edit buffer is re-read after a Program Change
+// went to the firmware. Done inside render(), which already holds deviceMutex, so the
+// re-read never makes the audio thread wait for another thread.
+int syncCountdown = -1;
+int preparedRate = 44100;
+
+// Block timing (render writes, monitor reads and resets). process() includes waiting for
+// the DSP threads, so a slow block means the DSPs fell behind or the render was delayed.
+std::atomic<std::uint32_t> maxProcessUs{0}, maxSysexProcessUs{0}, maxPresetProcessUs{0};
+std::atomic<std::uint64_t> blocks{0}, slowBlocks{0}, presetBlocks{0}, paramBlocks{0}, syncs{0};
 std::uint32_t currentRevision = 1;
 int currentBank = -1, currentProgram = -1;
 
@@ -75,7 +90,10 @@ void releaseDeviceLocked() {
     dspA.store(nullptr); dspB.store(nullptr);
     placer.forget();
     device.reset();
-    romIndex.reset();
+    {
+        std::lock_guard<std::mutex> romLock(romMutex);
+        romIndex.reset();
+    }
     deviceModel = virusLib::DeviceModel::Invalid;
     preparedFrames = 0;
     std::lock_guard<std::mutex> midiLock(midiMutex);
@@ -163,7 +181,7 @@ bool enqueueShortLocked(std::uint8_t a, std::uint8_t b, std::uint8_t c) {
             currentSingle[b] = c; ++currentRevision;
         }
     }
-    else if (command == 0xc0) { ++midiPc; externalChange = true; }
+    else if (command == 0xc0) { ++midiPc; externalChange = true; currentBank = currentProgram = -1; ++currentRevision; }
     if (shortQueue.size() >= maxShortEvents) { ++midiOverflow; return false; }
     shortQueue.emplace_back(synthLib::MidiEventSource::Host, a, b, c, 0);
     return true;
@@ -259,7 +277,11 @@ Java_com_rinoize_riostirus_NativeBridge_nativeLoadRom(JNIEnv* env, jclass, jbyte
             ? std::vector<std::string>{"DSP"} : std::vector<std::string>{"DSP DSP A", "DSP DSP B"};
         deviceModel = deviceModelRequested;
         device = std::move(created);
-        romIndex = std::move(index);
+        const auto romBanks = index->getNumSingleBanks();
+        {
+            std::lock_guard<std::mutex> romLock(romMutex);
+            romIndex = std::move(index);
+        }
         clearMeters();
         syncFromEngineLocked();
 
@@ -269,8 +291,7 @@ Java_com_rinoize_riostirus_NativeBridge_nativeLoadRom(JNIEnv* env, jclass, jbyte
             << " | DSP " << (dspB.load() ? 2 : 1)
             << " | reloj DSP " << device->getDspClockHz() / 1000000 << " MHz"
             << " | salidas " << device->getChannelCountOut()
-            << " | bancos ROM " << romIndex->getNumSingleBanks();
-        if (!romIndex->getOsVersion().empty()) out << " | OS " << romIndex->getOsVersion();
+            << " | bancos ROM " << romBanks;
         return env->NewStringUTF(out.str().c_str());
     });
 }
@@ -353,6 +374,10 @@ Java_com_rinoize_riostirus_RuntimeBridge_prepare(JNIEnv* env, jclass, jint frame
         interleaved.assign(static_cast<std::size_t>(frames * 2), 0.0f);
         midiIn.reserve(512); midiOut.reserve(512);
         preparedFrames = frames; appliedGain = targetGain.load(); clearMeters();
+        preparedRate = static_cast<int>(std::lround(device->getSamplerate()));
+        syncCountdown = -1;
+        maxProcessUs = maxSysexProcessUs = maxPresetProcessUs = 0;
+        blocks = slowBlocks = presetBlocks = paramBlocks = syncs = 0;
         {
             std::lock_guard<std::mutex> midiLock(midiMutex);
             parser.reset();
@@ -381,6 +406,7 @@ Java_com_rinoize_riostirus_RuntimeBridge_render(JNIEnv* env, jclass, jfloatArray
         for (std::size_t i = 0; i < inputs.size(); ++i) in[i] = inputs[i].data();
         for (std::size_t i = 0; i < outputs.size(); ++i) out[i] = outputs[i].data();
         midiIn.clear(); midiOut.clear();
+        bool programChange = false, preset = false, param = false;
         {
             std::lock_guard<std::mutex> midiLock(midiMutex);
             const auto budget = static_cast<std::size_t>(std::max(8, frames / 8));
@@ -389,10 +415,32 @@ Java_com_rinoize_riostirus_RuntimeBridge_render(JNIEnv* env, jclass, jfloatArray
             }
             if (!sysexQueue.empty()) {           // one SysEx per block keeps the firmware's input paced
                 sysexBytes -= sysexQueue.front().sysex.size();
+                (sysexQueue.front().sysex.size() > 64 ? preset : param) = true;
                 midiIn.emplace_back(std::move(sysexQueue.front())); sysexQueue.pop_front();
             }
         }
+        for (const auto& event : midiIn) if (event.sysex.empty() && (event.a & 0xf0) == 0xc0) programChange = true;
+        const auto started = std::chrono::steady_clock::now();
         device->process(in, out, static_cast<std::size_t>(frames), midiIn, midiOut);
+        const auto us = static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        auto raise = [](std::atomic<std::uint32_t>& slot, std::uint32_t value) {
+            if (value > slot.load(std::memory_order_relaxed)) slot.store(value, std::memory_order_relaxed);
+        };
+        raise(maxProcessUs, us);
+        if (preset) { raise(maxPresetProcessUs, us); presetBlocks.fetch_add(1, std::memory_order_relaxed); }
+        if (param) { raise(maxSysexProcessUs, us); paramBlocks.fetch_add(1, std::memory_order_relaxed); }
+        blocks.fetch_add(1, std::memory_order_relaxed);
+        if (static_cast<std::uint64_t>(us) * static_cast<std::uint64_t>(preparedRate) > 1000000ull * static_cast<std::uint64_t>(frames))
+            slowBlocks.fetch_add(1, std::memory_order_relaxed);
+        // Re-read the edit buffer ~150 ms after a keyboard Program Change reached the firmware.
+        if (programChange) syncCountdown = std::max(1, preparedRate * 150 / 1000 / frames);
+        else if (syncCountdown > 0 && --syncCountdown == 0) {
+            syncCountdown = -1;
+            if (syncFromEngineLocked()) syncs.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> midiLock(midiMutex);
+            externalChange = false;
+        }
         const float goal = targetGain.load(std::memory_order_relaxed);
         const float step = (goal - appliedGain) / static_cast<float>(frames);
         std::uint64_t clipped = 0, bad = 0; float peak = 0.0f;
@@ -435,7 +483,10 @@ Java_com_rinoize_riostirus_RuntimeBridge_setCpuPlacement(JNIEnv* env, jclass, ji
         if (mode < 0 || mode > 2) throw std::invalid_argument("Modo de nucleos invalido.");
         // Control worker, audio stopped: the DSP threads exist since the firmware boot.
         std::lock_guard<std::mutex> lock(deviceMutex); ensureDevice();
-        const auto summary = placer.apply(static_cast<rinoize::PlacementMode>(mode), placedThreads, watchedThreads);
+        // The UI threads (main and HWUI RenderThread) move off the DSP cores in Performance
+        // and Spread: on the A9 both fast cores are needed by the two TI DSPs.
+        const auto summary = placer.apply(static_cast<rinoize::PlacementMode>(mode), placedThreads, watchedThreads,
+                                          {rinoize::mainThreadName(), "RenderThread"});
         return env->NewStringUTF(summary.c_str());
     });
 }
@@ -446,6 +497,16 @@ Java_com_rinoize_riostirus_RuntimeBridge_placementReport(JNIEnv* env, jclass) {
         std::string text = placer.report();
         // getCurrentMips() is refreshed by each DSP thread about twice per second;
         // an unsynchronized read of a diagnostic double, never used for control.
+        // Block timing since the previous report (≈500 ms).
+        const auto period = preparedFrames > 0 && preparedRate > 0 ? 1000.0 * preparedFrames / preparedRate : 0.0;
+        char timing[200];
+        std::snprintf(timing, sizeof(timing),
+            "Bloques: max %.1f ms (plazo %.1f) · con patch %.1f ms (%llu) · con perilla %.1f ms (%llu) · lentos %llu/%llu · relecturas %llu",
+            maxProcessUs.exchange(0) / 1000.0, period, maxPresetProcessUs.exchange(0) / 1000.0,
+            static_cast<unsigned long long>(presetBlocks.load()), maxSysexProcessUs.exchange(0) / 1000.0,
+            static_cast<unsigned long long>(paramBlocks.load()), static_cast<unsigned long long>(slowBlocks.load()),
+            static_cast<unsigned long long>(blocks.load()), static_cast<unsigned long long>(syncs.load()));
+        text += (text.empty() ? "" : "\n") + std::string(timing);
         const std::pair<const char*, dsp56k::DSPThread*> threads[] = {{"DSP A", dspA.load()}, {"DSP B", dspB.load()}};
         for (const auto& [label, thread] : threads) {
             if (!thread) continue;
@@ -464,7 +525,8 @@ Java_com_rinoize_riostirus_RuntimeBridge_placementReport(JNIEnv* env, jclass) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_rinoize_riostirus_NativeBridge_nativeLibrary(JNIEnv* env, jclass) {
     return guarded<jstring>(env, nullptr, [&] {
-        std::lock_guard<std::mutex> lock(deviceMutex); ensureDevice();
+        std::lock_guard<std::mutex> lock(romMutex);
+        if (!romIndex) throw std::runtime_error("Primero cargue el firmware del Virus TI.");
         std::string out;
         out.reserve(64 * 128 * 32);
         const auto banks = static_cast<int>(romIndex->getNumSingleBanks());
@@ -488,7 +550,9 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_rinoize_riostirus_NativeBridge_nativeSelectPatch(JNIEnv* env, jclass, jint bank, jint program) {
     return guarded<jstring>(env, nullptr, [&] {
         if (program < 0 || program > 127) throw std::invalid_argument("Programa fuera de rango.");
-        std::lock_guard<std::mutex> lock(deviceMutex); ensureDevice();
+        // Never deviceMutex: selecting a sound while playing must not delay a render block.
+        std::lock_guard<std::mutex> lock(romMutex);
+        if (!romIndex) throw std::runtime_error("Primero cargue el firmware del Virus TI.");
         if (bank < 0 || bank >= static_cast<int>(romIndex->getNumSingleBanks())) throw std::invalid_argument("Banco fuera de rango.");
         virusLib::ROMFile::TPreset preset{};
         if (!romIndex->getSingle(bank, program, preset)) throw std::runtime_error("No se pudo leer ese patch de la ROM.");
@@ -553,24 +617,5 @@ Java_com_rinoize_riostirus_RuntimeBridge_currentName(JNIEnv* env, jclass) {
     return guarded<jstring>(env, nullptr, [&] {
         std::lock_guard<std::mutex> lock(midiMutex);
         return env->NewStringUTF(currentKnown ? cleanName(virusLib::ROMFile::getSingleName(currentSingle)).c_str() : "");
-    });
-}
-// Re-read the firmware edit buffer, e.g. after a Program Change from the keyboard.
-// Control thread only: briefly takes deviceMutex, like a render block.
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_rinoize_riostirus_RuntimeBridge_syncFromEngine(JNIEnv* env, jclass, jboolean external) {
-    return guarded<jboolean>(env, JNI_FALSE, [&] {
-        std::lock_guard<std::mutex> lock(deviceMutex);
-        {
-            std::lock_guard<std::mutex> midiLock(midiMutex);
-            // Wait until queued edits and the Program Change itself reached the firmware.
-            if (!sysexQueue.empty() || !shortQueue.empty()) return static_cast<jboolean>(JNI_FALSE);
-        }
-        const bool ok = syncFromEngineLocked();
-        if (ok && external) {
-            std::lock_guard<std::mutex> midiLock(midiMutex);
-            currentBank = currentProgram = -1; externalChange = false;
-        }
-        return static_cast<jboolean>(ok);
     });
 }

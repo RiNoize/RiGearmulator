@@ -148,6 +148,26 @@ void testLiveThreads() {
     require(sched_getaffinity(tid, sizeof(mask), &mask) == 0 && CPU_COUNT(&mask) == 1, "forget leaves threads alone");
     sched_setaffinity(tid, sizeof(process), &process);
 
+    // Background threads (UI) are moved off the fast group and restored by Automatic and forget().
+    {
+        NamedWorker ui("UiThreadX");
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const pid_t uiTid = rinoize::findThreadsByName("UiThreadX").front();
+        rinoize::ThreadPlacer bg(sysfs);
+        summary = bg.apply(rinoize::PlacementMode::Spread, {"DSP A"}, {}, {"UiThreadX", "missing"});
+        require(sched_getaffinity(uiTid, sizeof(mask), &mask) == 0 && !CPU_ISSET(1, &mask) && CPU_ISSET(0, &mask),
+                "UI thread kept off the fast CPU: " + summary);
+        require(summary.find("UiThreadX " + original + "->") != std::string::npos, "background in summary: " + summary);
+        bg.apply(rinoize::PlacementMode::Automatic, {"DSP A"}, {}, {"UiThreadX"});
+        require(sched_getaffinity(uiTid, sizeof(mask), &mask) == 0 && CPU_ISSET(1, &mask), "Automatic restores UI thread");
+        bg.apply(rinoize::PlacementMode::Performance, {"DSP A"}, {}, {"UiThreadX"});
+        require(sched_getaffinity(uiTid, sizeof(mask), &mask) == 0 && !CPU_ISSET(1, &mask), "Performance moves UI thread");
+        bg.forget();
+        require(sched_getaffinity(uiTid, sizeof(mask), &mask) == 0 && CPU_ISSET(1, &mask), "forget restores UI thread");
+        sched_setaffinity(tid, sizeof(process), &process);
+        require(!rinoize::mainThreadName().empty(), "main thread name");
+    }
+
     // Watched-only thread appears in the report without being placed.
     rinoize::ThreadPlacer watcher(sysfs);
     watcher.apply(rinoize::PlacementMode::Performance, {}, {"MC68331"});

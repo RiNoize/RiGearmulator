@@ -178,6 +178,11 @@ inline std::vector<int> selectFastestCpus(const CpuTopology& topology, const cpu
     return {};
 }
 
+// comm of the process main thread (tid == pid), e.g. a truncated package name.
+inline std::string mainThreadName(const std::string& taskDir = "/proc/self/task") {
+    return placementDetail::readComm(taskDir + "/" + std::to_string(getpid()) + "/comm");
+}
+
 inline std::vector<pid_t> findThreadsByName(const std::string& name, const std::string& taskDir = "/proc/self/task") {
     std::vector<pid_t> result;
     DIR* dir = opendir(taskDir.c_str());
@@ -199,10 +204,13 @@ public:
         : m_cpuRoot(std::move(cpuRoot)), m_taskDir(std::move(taskDir)) {}
 
     // `placed` threads get the policy; `watched` threads are only reported (for
-    // example the Java render thread, which may start after this call).
-    // The engine threads must already exist. Returns a one-line summary.
+    // example the Java render thread, which may start after this call);
+    // `background` threads (UI) are kept OFF the fast group in Performance and Spread,
+    // so they never compete with the placed threads. The engine threads must already
+    // exist. Returns a one-line summary.
     std::string apply(PlacementMode mode, const std::vector<std::string>& placed,
-                      const std::vector<std::string>& watched = {}) {
+                      const std::vector<std::string>& watched = {},
+                      const std::vector<std::string>& background = {}) {
         std::lock_guard<std::mutex> lock(m_mutex);
         restoreLocked();
         m_entries.clear();
@@ -226,12 +234,36 @@ public:
                 m_entries.push_back(entry);
             }
         }
+        if (mode != PlacementMode::Automatic && !m_fastest.empty()) {
+            for (const auto& name : background) {
+                if (name.empty()) continue;
+                for (const pid_t tid : findThreadsByName(name, m_taskDir)) {
+                    Entry entry;
+                    entry.name = name; entry.tid = tid;
+                    if (sched_getaffinity(tid, sizeof(entry.original), &entry.original) != 0) continue;
+                    entry.effective = entry.original;
+                    cpu_set_t rest = entry.original;
+                    for (const int cpu : m_fastest) CPU_CLR(cpu, &rest);
+                    if (CPU_COUNT(&rest) > 0) {
+                        if (sched_setaffinity(tid, sizeof(rest), &rest) == 0) {
+                            entry.touched = true;
+                            sched_getaffinity(tid, sizeof(entry.effective), &entry.effective);
+                        } else entry.error = errno;
+                    }
+                    m_entries.push_back(entry);
+                }
+            }
+        }
         return summaryLocked(placed);
     }
 
     // The engine was destroyed: its threads are gone. Never touch old TIDs.
+    // Background (UI) threads outlive the engine, so their masks are restored.
     void forget() {
         std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& entry : m_entries)
+            if (!entry.placed && entry.touched && alive(entry))
+                sched_setaffinity(entry.tid, sizeof(entry.original), &entry.original);
         m_entries.clear();
         m_watched.clear();
     }

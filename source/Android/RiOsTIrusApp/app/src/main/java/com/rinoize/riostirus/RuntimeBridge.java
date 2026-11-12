@@ -20,6 +20,4 @@ public final class RuntimeBridge {
     /** [revision, flags (1 known, 2 external program change pending), bank, program, values...]. */
     public static native int[] values(int[] pages, int[] indices);
     public static native String currentName();
-    /** Control thread: re-read the firmware edit buffer. external = after a keyboard Program Change. */
-    public static native boolean syncFromEngine(boolean external);
 }
