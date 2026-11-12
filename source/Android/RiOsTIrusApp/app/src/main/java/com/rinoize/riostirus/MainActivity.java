@@ -5,6 +5,9 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.media.AudioDeviceCallback;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -37,7 +40,7 @@ import java.util.concurrent.Executors;
  * on the OsTIrus plugin (collections, categories, tags, search, favourites), and the 0.1.0
  * test bench as the settings page. */
 public final class MainActivity extends Activity implements PlayPanel.Host, LibraryPanel.Host {
-    private static final String VERSION = "0.2.1";
+    private static final String VERSION = "0.2.2";
     private static final int PICK_FIRMWARE = 1;
     private static final int MAX_FIRMWARE = 10 * 1024 * 1024;
     private static final int RECENT_LIMIT = 40;
@@ -62,7 +65,14 @@ public final class MainActivity extends Activity implements PlayPanel.Host, Libr
     private List<MidiInput.Choice> ports = new ArrayList<>();
     private TextView stats, status, subtitle, engineInfo, diagnostics, midiStatus;
     private Button play, stop, loadButton, bootButton;
-    private Spinner midiChoice;
+    private Spinner midiChoice, rateChoice, outputChoice;
+    private AudioManager audioManager;
+    private List<AudioDeviceInfo> outputs = new ArrayList<>();
+    private boolean bindingOutputs;
+    private final AudioDeviceCallback outputWatcher = new AudioDeviceCallback() {
+        @Override public void onAudioDevicesAdded(AudioDeviceInfo[] added) { refreshOutputs(); }
+        @Override public void onAudioDevicesRemoved(AudioDeviceInfo[] removed) { refreshOutputs(); }
+    };
     private PlayPanel playPanel;
     private LibraryPanel libraryPanel;
     private View[] pages;
@@ -106,8 +116,11 @@ public final class MainActivity extends Activity implements PlayPanel.Host, Libr
         try { NativeBridge.nativeGetCoreInfo(); nativeOk = true; }
         catch (LinkageError e) { nativeOk = false; }
         midi = new MidiInput(this, ui, () -> ready && !busy, () -> post(this::refreshPorts));
+        audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
         setContentView(buildUi());
         refreshPorts();
+        refreshOutputs();
+        if (audioManager != null) audioManager.registerAudioDeviceCallback(outputWatcher, ui);
         showPage(firmwareFile().isFile() ? PAGE_PLAY : PAGE_SETTINGS);
         if (!nativeOk) message("La biblioteca nativa no cargó. Este APK necesita ARM64.");
         else if (firmwareFile().isFile()) boot(null, firmwareName);
@@ -123,6 +136,7 @@ public final class MainActivity extends Activity implements PlayPanel.Host, Libr
     }
     @Override protected void onDestroy() {
         destroyed = true; ui.removeCallbacksAndMessages(null);
+        if (audioManager != null) audioManager.unregisterAudioDeviceCallback(outputWatcher);
         if (midi != null) midi.close();
         control.shutdown();
         worker.execute(() -> {
@@ -195,7 +209,8 @@ public final class MainActivity extends Activity implements PlayPanel.Host, Libr
         firmwareCard.addView(Snow.text(this, "El archivo del sistema operativo del Virus TI (el mismo que usa OsTIrus en la PC) sirve para TI, TI2 y Snow. Modelo y frecuencia se aplican con REINICIAR MOTOR; Snow usa un solo DSP.", 11, Snow.MUTED));
         LinearLayout engine = Snow.row(this); engine.setPadding(0, Snow.dp(this, 6), 0, 0);
         engineSettings.add(setting(engine, "Modelo", MODELS, "model", 0));
-        engineSettings.add(setting(engine, "Frecuencia", new String[]{"44100 Hz", "48000 Hz"}, "rate", 0));
+        rateChoice = setting(engine, "Frecuencia", new String[]{"44100 Hz", "48000 Hz"}, "rate", 0);
+        engineSettings.add(rateChoice);
         firmwareCard.addView(engine);
         content.addView(firmwareCard);
 
@@ -206,6 +221,22 @@ public final class MainActivity extends Activity implements PlayPanel.Host, Libr
         engineSettings.add(setting(audioRow, "Modo", new String[]{"Conservador", "Baja latencia + AUTO"}, "mode", 1));
         engineSettings.add(setting(audioRow, "Buffer salida", new String[]{"512", "768", "1024", "1536", "2048", "3072", "4096"}, "output", 3));
         audioCard.addView(audioRow);
+        LinearLayout outputRow = Snow.row(this);
+        LinearLayout outputBox = Snow.column(this); outputBox.addView(Snow.label(this, "Salida de audio"));
+        outputChoice = new Spinner(this);
+        outputChoice.setBackground(Snow.surface(this, Snow.PANEL_LOW, Snow.EDGE, 6));
+        outputChoice.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            public void onItemSelected(AdapterView<?> a, View v, int p, long id) {
+                if (v instanceof TextView) ((TextView) v).setTextColor(Snow.TEXT);
+                if (!bindingOutputs) outputChosen(p);
+            }
+            public void onNothingSelected(AdapterView<?> a) {}
+        });
+        LinearLayout.LayoutParams op = new LinearLayout.LayoutParams(-1, Snow.dp(this, 42)); op.setMargins(0, Snow.dp(this, 4), 0, 0);
+        outputBox.addView(outputChoice, op);
+        outputRow.addView(outputBox, new LinearLayout.LayoutParams(0, -2, 1));
+        audioCard.addView(outputRow);
+        audioCard.addView(Snow.text(this, "Con auriculares en la tablet, Android manda el audio al jack aunque haya una placa USB: elegí acá el KROSS u otra placa. Si la salida trabaja a otra frecuencia, el motor se reinicia en la correcta para no perder la baja latencia.", 11, Snow.MUTED));
         LinearLayout cores = Snow.row(this);
         engineSettings.add(setting(cores, "Núcleos (hilos DSP)", new String[]{"Automático (Android decide)",
                 "Rendimiento: núcleos rápidos", "Repartido: un núcleo rápido por DSP"}, "cpu", RealtimeAudio.CPU_SPREAD));
@@ -431,11 +462,15 @@ public final class MainActivity extends Activity implements PlayPanel.Host, Libr
         final int mode = bounded(prefs.getInt("mode", 1), 2);
         final int output = OUTPUTS[bounded(prefs.getInt("output", 3), OUTPUTS.length)];
         final int cpu = bounded(prefs.getInt("cpu", RealtimeAudio.CPU_SPREAD), 3);
+        final String outputKey = prefs.getString("outputKey", "");
+        final AudioDeviceInfo device = audioManager == null ? null : OutputDevices.find(audioManager, outputKey);
         work("Iniciando audio…", () -> {
             if (!visible) return;
-            audio.start(frames, clock, -6, mode, output, cpu);
+            audio.start(frames, clock, -6, mode, output, cpu, device);
             lastError = "";
-            post(() -> message("Audio activo"));
+            String where = device != null ? " por " + OutputDevices.label(device)
+                    : outputKey.isEmpty() ? "" : " (la salida elegida no está conectada: decide Android)";
+            post(() -> message("Audio activo" + where));
         });
     }
 
@@ -519,6 +554,51 @@ public final class MainActivity extends Activity implements PlayPanel.Host, Libr
         bootButton.setEnabled(available && firmwareFile().isFile());
         for (Button b : needsEngine) b.setEnabled(available && ready);
         for (Spinner s : engineSettings) s.setEnabled(available && !live);
+        if (outputChoice != null) outputChoice.setEnabled(available && !live);
+    }
+
+    /** Rebuild the output list (on start and whenever Android adds or removes a device). */
+    private void refreshOutputs() {
+        if (outputChoice == null || audioManager == null) return;
+        outputs = OutputDevices.list(audioManager);
+        String key = prefs.getString("outputKey", "");
+        List<String> names = new ArrayList<>();
+        names.add("Automática (Android decide)");
+        int selected = 0;
+        for (int i = 0; i < outputs.size(); i++) {
+            names.add(OutputDevices.label(outputs.get(i)));
+            if (OutputDevices.key(outputs.get(i)).equals(key)) selected = i + 1;
+        }
+        if (!key.isEmpty() && selected == 0) {      // remembered device unplugged: keep the choice
+            String name = key.substring(key.indexOf('|') + 1);
+            names.add((name.isEmpty() ? "Salida elegida" : name) + " (desconectada)");
+            selected = names.size() - 1;
+        }
+        bindingOutputs = true;
+        outputChoice.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, names));
+        outputChoice.setSelection(selected, false);
+        outputChoice.post(() -> bindingOutputs = false);
+    }
+
+    private void outputChosen(int position) {
+        if (position > outputs.size()) return;                       // the "(desconectada)" entry
+        AudioDeviceInfo device = position == 0 ? null : outputs.get(position - 1);
+        String key = device == null ? "" : OutputDevices.key(device);
+        if (key.equals(prefs.getString("outputKey", ""))) return;
+        prefs.edit().putString("outputKey", key).apply();
+        if (device == null) { message("Salida automática: Android decide"); return; }
+        int current = RATES[bounded(prefs.getInt("rate", 0), RATES.length)];
+        int best = OutputDevices.bestRate(device, current);
+        if (best == current) {
+            message(OutputDevices.label(device) + " elegida · acepta " + OutputDevices.rates(device) + " · se aplica al iniciar el audio");
+            return;
+        }
+        // A rate mismatch makes Android resample and leave the low-latency path: match it.
+        int index = best == 48000 ? 1 : 0;
+        prefs.edit().putInt("rate", index).apply();
+        if (rateChoice != null) rateChoice.setSelection(index, false);
+        message(OutputDevices.label(device) + " trabaja a " + best + " Hz: reinicio el motor a " + best + " Hz");
+        if (ready && firmwareFile().isFile() && !audio.hasLiveSession()) boot(null, firmwareName);
     }
 
     private void refreshPorts() {

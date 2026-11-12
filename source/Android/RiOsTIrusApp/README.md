@@ -1,4 +1,9 @@
-# RiOsTIrus Android 0.2.1 alpha — Snow White
+# RiOsTIrus Android 0.2.2 alpha — Snow White
+
+## Salida de audio 0.2.2
+
+AJUSTES → «Salida de audio» elige el dispositivo (Automática, parlante, jack, USB como el KROSS 2, HDMI, Bluetooth). Android, por sí solo, prefiere el jack de auriculares a una placa USB; la app usa `AudioTrack.setPreferredDevice` antes de `play()`. La elección se recuerda por tipo y nombre (los ids cambian al reconectar) y la lista se actualiza al conectar o desconectar. Si la salida no acepta la frecuencia del motor, la app cambia a la que acepta (48000 Hz en el KROSS) y reinicia el motor: con frecuencias distintas Android remuestrea y deja el camino de baja latencia. El diagnóstico muestra «Salida elegida» y la ruta real.
+
 
 ## Audio 0.2.1
 

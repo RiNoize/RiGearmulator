@@ -76,8 +76,10 @@ public final class RealtimeAudio {
         Session s = current; return s != null && !s.finished;
     }
 
+    /** preferredOutput: null lets Android choose (it prefers the headphone jack over USB). */
     public void start(int frames, int clockPercent, int gainDb,
-                      int outputMode, int requestedOutputFrames, int cpuPlacement) throws Exception {
+                      int outputMode, int requestedOutputFrames, int cpuPlacement,
+                      AudioDeviceInfo preferredOutput) throws Exception {
         stop();
         if (outputMode != CONSERVATIVE && outputMode != LOW_LATENCY)
             throw new IllegalArgumentException("Modo de salida desconocido");
@@ -114,6 +116,14 @@ public final class RealtimeAudio {
         try {
             if (track.getState() != AudioTrack.STATE_INITIALIZED || track.getSampleRate() != sampleRate)
                 throw new IllegalStateException("AudioTrack no acepto la frecuencia solicitada");
+            // Route before play(), so the first start already goes to the chosen device.
+            if (preferredOutput != null) {
+                boolean routed = track.setPreferredDevice(preferredOutput);
+                configuration += "\nSalida elegida: " + OutputDevices.label(preferredOutput)
+                        + " · acepta " + OutputDevices.rates(preferredOutput) + (routed ? "" : " · Android la rechazó");
+            } else {
+                configuration += "\nSalida elegida: automática (Android decide)";
+            }
             if (outputMode == LOW_LATENCY) {
                 int accepted = track.setBufferSizeInFrames(requestedOutputFrames);
                 if (accepted <= 0) throw new IllegalStateException(
